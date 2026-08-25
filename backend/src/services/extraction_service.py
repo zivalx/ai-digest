@@ -117,12 +117,16 @@ class ExtractionService:
         self,
         model: Optional[str] = None,
         structured_llm: Any = None,
-        min_confidence: float = MIN_CONFIDENCE,
+        min_confidence: Optional[float] = None,
         temperature: float = 0.0,
         llm_providers: Optional[str] = None,
     ):
         self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
-        self.min_confidence = min_confidence
+        self.min_confidence = (
+            min_confidence
+            if min_confidence is not None
+            else float(os.getenv("EXTRACTION_MIN_CONFIDENCE", str(MIN_CONFIDENCE)))
+        )
         self.temperature = temperature
         self.llm_providers = llm_providers or os.getenv("LLM_PROVIDERS", DEFAULT_LLM_PROVIDERS)
         self._structured_llm = structured_llm
