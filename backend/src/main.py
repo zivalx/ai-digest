@@ -26,6 +26,10 @@ app.add_middleware(
 )
 
 
+# Holds the finance-feeder scheduler instance when enabled.
+feeder_scheduler = None
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and services on startup."""
@@ -34,6 +38,27 @@ async def startup_event():
     logger.info("Initializing database tables...")
     await init_db()
     logger.info("Database initialization complete")
+
+    # Channel-intelligence feeder scheduler (guarded so tests/local runs don't auto-start it).
+    from src.config import get_settings
+    settings = get_settings()
+    if settings.feeder_enabled:
+        global feeder_scheduler
+        from src.services.scheduler_service import SchedulerService
+        feeder_scheduler = SchedulerService()
+        feeder_scheduler.start()
+        logger.info("Finance feeder enabled (interval=%ss)", settings.feeder_interval_seconds)
+    else:
+        logger.info("Finance feeder disabled (set FEEDER_ENABLED=true to enable)")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop background services on shutdown."""
+    global feeder_scheduler
+    if feeder_scheduler is not None:
+        feeder_scheduler.shutdown()
+        feeder_scheduler = None
 
 
 @app.get("/")
