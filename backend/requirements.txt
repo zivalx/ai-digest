@@ -19,9 +19,13 @@ langchain>=0.1.0
 langchain-openai>=0.0.2
 langchain-anthropic>=0.1.0  # Optional: for Claude support
 
+# Scheduler (channel-intelligence feeder)
+apscheduler>=3.10.0
+
 # Config and environment
 pyyaml>=6.0.0
 python-dotenv>=1.0.0
+pydantic-settings>=2.0.0
 
 # Testing dependencies
 pytest>=7.4.0

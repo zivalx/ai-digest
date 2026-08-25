@@ -6,6 +6,7 @@ from .cycle import Cycle
 from .collected_data import CollectedData
 from .summary import Summary
 from .source_config import SourceConfig
+from .extracted_mention import ExtractedMention
 
 __all__ = [
     "Base",
@@ -13,4 +14,5 @@ __all__ = [
     "CollectedData",
     "Summary",
     "SourceConfig",
+    "ExtractedMention",
 ]

@@ -31,6 +31,9 @@ class SourceConfig(Base):
     # Collection specification (what to collect)
     collect_spec = Column(JSON, nullable=False)
 
+    # Pipeline purpose: "general" (default digest) or "finance" (channel-intel feeder)
+    purpose = Column(String(50), nullable=False, default="general")
+
     # Status
     enabled = Column(Boolean, default=True)
 
