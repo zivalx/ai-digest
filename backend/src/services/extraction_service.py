@@ -1,11 +1,18 @@
 """
-Extraction Service - turns collected items into ticker/asset picks via Claude.
+Extraction Service - turns collected items into ticker/asset picks via an LLM.
 
-Uses ai-digest's existing LangChain stack (``langchain_anthropic.ChatAnthropic``)
-with ``.with_structured_output(...)`` so Claude returns a constrained list of
-picks. Transcripts are passed WITH time markers (derived from
-``transcript_segments``) so the model can anchor each pick to a ``start_seconds``,
-which we turn into a ``https://youtu.be/<id>?t=<seconds>`` deep-link.
+Uses ai-digest's existing LangChain stack with ``.with_structured_output(...)``
+so the model returns a constrained list of picks. Transcripts are passed WITH
+time markers (derived from ``transcript_segments``) so the model can anchor
+each pick to a ``start_seconds``, which we turn into a
+``https://youtu.be/<id>?t=<seconds>`` deep-link.
+
+Provider-agnostic fallback chain: rather than hardcoding Claude, the
+structured-output runnable is built as a quality-first fallback chain across
+providers configured via ``LLM_PROVIDERS`` (default ``"anthropic,xai,deepseek"``,
+see ``src.config``/``src.services.llm_factory``). LangChain's
+``Runnable.with_fallbacks`` is used to fall through to the next provider on
+a rate limit, API error, or a failed/malformed structured-output attempt.
 
 The service never invents symbols; malformed or low-confidence picks are dropped
 and the dropped count is logged. Authoritative symbol validation happens
@@ -24,6 +31,20 @@ logger = logging.getLogger(__name__)
 MIN_CONFIDENCE = 0.3
 
 _STANCES = {"bullish", "bearish", "neutral"}
+
+# Default quality-first provider order for the extraction fallback chain.
+DEFAULT_LLM_PROVIDERS = "anthropic,xai,deepseek"
+
+# Providers whose LangChain chat model is OpenAI-compatible under the hood
+# (xai/deepseek/openai all subclass langchain_openai's BaseChatOpenAI) --
+# these should force ``method="function_calling"`` on
+# ``with_structured_output`` since their default flipped to ``"json_schema"``,
+# which isn't reliably supported by every OpenAI-compatible endpoint.
+# Anthropic's ``with_structured_output`` already defaults to
+# ``"function_calling"`` in the installed langchain-anthropic version, so
+# passing it explicitly there too is a no-op that keeps all providers
+# consistent and explicit.
+STRUCTURED_OUTPUT_METHOD = "function_calling"
 
 
 class RawPick(BaseModel):
@@ -75,15 +96,21 @@ SYSTEM_PROMPT = (
 
 class ExtractionService:
     """
-    Extract ticker picks from collected items using Claude structured output.
+    Extract ticker picks from collected items using an LLM fallback chain.
 
     Args:
-        model: Anthropic model id (default from env ``ANTHROPIC_MODEL`` /
-            ``claude-sonnet-5``).
+        model: Explicit Anthropic model id override, used only for the
+            ``anthropic`` provider in the chain (default from env
+            ``ANTHROPIC_MODEL`` / ``claude-sonnet-5``). Other providers use
+            their own env-configured defaults -- see
+            ``src.services.llm_factory``.
         structured_llm: Optional pre-built runnable exposing ``ainvoke(messages)``
             returning a :class:`PickList`. Injected in tests to avoid a real call;
-            built lazily from ``ChatAnthropic`` on first use when not provided.
+            built lazily as a multi-provider fallback chain on first use when
+            not provided.
         min_confidence: Picks below this confidence are dropped.
+        llm_providers: Comma-separated provider order for the fallback chain.
+            Defaults to env ``LLM_PROVIDERS`` / ``"anthropic,xai,deepseek"``.
     """
 
     def __init__(
@@ -92,29 +119,72 @@ class ExtractionService:
         structured_llm: Any = None,
         min_confidence: float = MIN_CONFIDENCE,
         temperature: float = 0.0,
+        llm_providers: Optional[str] = None,
     ):
         self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
         self.min_confidence = min_confidence
         self.temperature = temperature
+        self.llm_providers = llm_providers or os.getenv("LLM_PROVIDERS", DEFAULT_LLM_PROVIDERS)
         self._structured_llm = structured_llm
 
     @property
     def structured_llm(self):
-        """Lazily build the ChatAnthropic structured-output runnable."""
+        """Lazily build the provider fallback chain's structured-output runnable."""
         if self._structured_llm is None:
-            from langchain_anthropic import ChatAnthropic
-
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise ValueError("ANTHROPIC_API_KEY environment variable not set")
-
-            llm = ChatAnthropic(
-                model=self.model,
-                temperature=self.temperature,
-                api_key=api_key,
-            )
-            self._structured_llm = llm.with_structured_output(PickList)
+            self._structured_llm = self._build_fallback_chain()
         return self._structured_llm
+
+    def _parse_providers(self) -> List[str]:
+        """Parse and validate the ordered provider list from ``self.llm_providers``."""
+        from src.services.llm_factory import SUPPORTED_PROVIDERS
+
+        providers = [p.strip().lower() for p in self.llm_providers.split(",") if p.strip()]
+        if not providers:
+            raise ValueError(
+                f"LLM_PROVIDERS must contain at least one provider, got {self.llm_providers!r}"
+            )
+        for provider in providers:
+            if provider not in SUPPORTED_PROVIDERS:
+                raise ValueError(
+                    f"Unsupported provider in LLM_PROVIDERS: {provider!r}. "
+                    f"Expected one of: {SUPPORTED_PROVIDERS}"
+                )
+        return providers
+
+    def _build_provider_runnable(self, provider: str):
+        """Build one provider's structured-output runnable, tagged for attribution logging."""
+        from langchain_core.runnables import RunnableLambda
+        from src.services.llm_factory import build_chat_model
+
+        # Only the anthropic leg respects an explicit `model=` override passed
+        # to the service constructor; other providers use their own env-based
+        # defaults (XAI_MODEL / DEEPSEEK_MODEL) via the factory.
+        model_override = self.model if provider == "anthropic" else None
+        llm = build_chat_model(provider, model=model_override, temperature=self.temperature)
+        structured = llm.with_structured_output(PickList, method=STRUCTURED_OUTPUT_METHOD)
+
+        async def _invoke(messages):
+            result = await structured.ainvoke(messages)
+            logger.info("Extraction served by provider=%s", provider)
+            return result
+
+        return RunnableLambda(_invoke, name=f"extraction_provider_{provider}")
+
+    def _build_fallback_chain(self):
+        """
+        Compose the quality-first fallback chain: primary.with_fallbacks([...]).
+
+        LangChain's ``with_fallbacks`` catches an error from the primary
+        runnable (rate limit, API error, or a failed/malformed structured
+        output) and retries the next runnable in order. Each per-provider
+        runnable is wrapped so a successful call logs which provider served
+        the result -- ``with_fallbacks`` itself doesn't expose that.
+        """
+        providers = self._parse_providers()
+        runnables = [self._build_provider_runnable(p) for p in providers]
+        primary, *fallbacks = runnables
+        logger.info("Extraction fallback chain built: %s", providers)
+        return primary.with_fallbacks(fallbacks)
 
     # ------------------------------------------------------------------ #
     # Public API

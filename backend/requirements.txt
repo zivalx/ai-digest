@@ -18,6 +18,12 @@ connectors[all]>=0.1.0
 langchain>=0.1.0
 langchain-openai>=0.0.2
 langchain-anthropic>=0.1.0  # Optional: for Claude support
+# xAI (Grok) and DeepSeek providers for the extraction fallback chain.
+# If either package is unavailable at runtime, src/services/llm_factory.py
+# falls back to langchain_openai.ChatOpenAI pointed at that provider's
+# OpenAI-compatible base_url (https://api.x.ai/v1, https://api.deepseek.com).
+langchain-xai>=0.1.0
+langchain-deepseek>=0.1.0
 
 # Scheduler (channel-intelligence feeder)
 apscheduler>=3.10.0
