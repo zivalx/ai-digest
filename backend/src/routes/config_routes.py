@@ -35,6 +35,7 @@ async def create_config(
         credential_ref=config_data.credential_ref,
         collect_spec=config_data.collect_spec,
         enabled=config_data.enabled,
+        purpose=config_data.purpose,
     )
 
     db.add(config)
@@ -112,6 +113,8 @@ async def update_config(
         config.collect_spec = config_data.collect_spec
     if config_data.enabled is not None:
         config.enabled = config_data.enabled
+    if config_data.purpose is not None:
+        config.purpose = config_data.purpose
 
     await db.commit()
     await db.refresh(config)
