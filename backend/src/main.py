@@ -73,10 +73,22 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Detailed health check."""
+    """Detailed health check — pings the database."""
+    from sqlalchemy import text
+    from src.database import AsyncSessionLocal
+
+    database = "connected"
+    status = "healthy"
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:
+        database = f"error: {exc.__class__.__name__}"
+        status = "degraded"
+
     return {
-        "status": "healthy",
-        "database": "connected",  # TODO: Add real DB check
+        "status": status,
+        "database": database,
         "services": {
             "collectors": "ready",
             "summarizer": "ready",
