@@ -238,9 +238,20 @@ class CollectionOrchestrator:
         if not all([api_id, api_hash, phone]):
             raise CollectionError(f"Missing Telegram credentials for {credential_ref}")
 
-        # Simple auth callbacks for non-interactive mode
+        # Auth callbacks. Telethon only invokes get_code when there's no valid
+        # session (first login or an expired/revoked one). On a headless server
+        # (no TTY) there's nothing to read a code from, so fail fast with a clear
+        # message instead of blocking forever on input().
+        import sys
+
         async def get_code():
-            return input("Enter Telegram 2FA code: ")
+            if not sys.stdin or not sys.stdin.isatty():
+                raise CollectionError(
+                    f"Telegram session for {credential_ref} is missing or expired and no "
+                    f"interactive terminal is available to enter the login code. Generate the "
+                    f".session file locally (one interactive login) and deploy it, then retry."
+                )
+            return input("Enter Telegram login code: ")
 
         async def get_password():
             return os.getenv(f"{credential_ref}_PASSWORD", "")
