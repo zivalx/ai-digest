@@ -118,7 +118,7 @@ class ExtractionService:
         model: Optional[str] = None,
         structured_llm: Any = None,
         min_confidence: Optional[float] = None,
-        temperature: float = 0.0,
+        temperature: Optional[float] = None,
         llm_providers: Optional[str] = None,
     ):
         self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")

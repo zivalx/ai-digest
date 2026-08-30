@@ -73,7 +73,7 @@ def _require_api_key(provider: str) -> str:
 def build_chat_model(
     provider: str,
     model: Optional[str] = None,
-    temperature: float = 0,
+    temperature: Optional[float] = None,
 ) -> Any:
     """
     Build a LangChain chat model for the given provider.
@@ -104,15 +104,19 @@ def build_chat_model(
     resolved_model = model or os.getenv(env_var, default_model)
     api_key = _require_api_key(normalized)
 
+    # Only pass temperature when explicitly set — some newer models
+    # (e.g. claude-sonnet-5) reject the param entirely.
+    temp_kwargs = {} if temperature is None else {"temperature": temperature}
+
     if normalized == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(model=resolved_model, temperature=temperature, api_key=api_key)
+        return ChatAnthropic(model=resolved_model, api_key=api_key, **temp_kwargs)
 
     if normalized == "openai":
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(model=resolved_model, temperature=temperature, api_key=api_key)
+        return ChatOpenAI(model=resolved_model, api_key=api_key, **temp_kwargs)
 
     if normalized == "xai":
         try:
@@ -126,11 +130,11 @@ def build_chat_model(
 
             return ChatOpenAI(
                 model=resolved_model,
-                temperature=temperature,
                 api_key=api_key,
                 base_url="https://api.x.ai/v1",
+                **temp_kwargs,
             )
-        return ChatXAI(model=resolved_model, temperature=temperature, api_key=api_key)
+        return ChatXAI(model=resolved_model, api_key=api_key, **temp_kwargs)
 
     # normalized == "deepseek"
     try:
@@ -144,8 +148,8 @@ def build_chat_model(
 
         return ChatOpenAI(
             model=resolved_model,
-            temperature=temperature,
             api_key=api_key,
             base_url="https://api.deepseek.com",
+            **temp_kwargs,
         )
-    return ChatDeepSeek(model=resolved_model, temperature=temperature, api_key=api_key)
+    return ChatDeepSeek(model=resolved_model, api_key=api_key, **temp_kwargs)
