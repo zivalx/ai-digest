@@ -18,12 +18,14 @@ import {
   Settings as SettingsIcon,
   Add as AddIcon,
   Bolt as BoltIcon,
+  Tune as TuneIcon,
 } from '@mui/icons-material';
 
 export default function Sidebar({ activeView, onViewChange, onCreateClick }) {
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: <DashboardIcon /> },
     { id: 'all-digests', label: 'All Digests', icon: <InboxIcon /> },
+    { id: 'channels', label: 'Sources', icon: <TuneIcon /> },
     { id: 'settings', label: 'Settings', icon: <SettingsIcon /> },
   ];
 

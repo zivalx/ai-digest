@@ -205,7 +205,10 @@ class CollectionOrchestrator:
         # Build collect spec
         spec = YouTubeCollectSpec(
             channels=collect_spec.get("channels", []),
-            max_videos_per_channel=collect_spec.get("max_videos", 10),
+            max_videos_per_channel=(
+                collect_spec.get("max_videos_per_channel")
+                or collect_spec.get("max_videos", 5)
+            ),
             days_back=collect_spec.get("days_back", 7),
         )
 
