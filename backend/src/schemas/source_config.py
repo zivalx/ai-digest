@@ -14,6 +14,7 @@ class SourceConfigCreate(BaseModel):
     credential_ref: str = Field(..., description="Credential reference (env var prefix)")
     collect_spec: Dict[str, Any] = Field(..., description="Collection specification")
     enabled: bool = Field(True, description="Whether this config is enabled")
+    purpose: str = Field("general", description="Feed purpose: 'general' or 'finance' (finance feeds run the trender channel-intel pipeline)")
 
 
 class SourceConfigUpdate(BaseModel):
@@ -22,6 +23,7 @@ class SourceConfigUpdate(BaseModel):
     credential_ref: Optional[str] = None
     collect_spec: Optional[Dict[str, Any]] = None
     enabled: Optional[bool] = None
+    purpose: Optional[str] = None
 
 
 class SourceConfigResponse(BaseModel):
@@ -32,6 +34,7 @@ class SourceConfigResponse(BaseModel):
     credential_ref: str
     collect_spec: Dict[str, Any]
     enabled: bool
+    purpose: str
     created_at: datetime
     updated_at: datetime
 

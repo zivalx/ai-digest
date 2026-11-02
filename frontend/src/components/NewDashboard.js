@@ -25,6 +25,7 @@ import DigestWizard from './DigestWizard';
 import SummaryViewer from './SummaryViewer';
 import AllDigestsView from './AllDigestsView';
 import SettingsView from './SettingsView';
+import ChannelConfig from './ChannelConfig';
 import apiService from '../api/apiService';
 
 export default function NewDashboard() {
@@ -84,6 +85,10 @@ export default function NewDashboard() {
 
     if (activeView === 'all-digests') {
       return <AllDigestsView onDigestClick={handleCycleClick} onCreateClick={handleCreateClick} />;
+    }
+
+    if (activeView === 'channels') {
+      return <ChannelConfig />;
     }
 
     if (activeView === 'settings') {

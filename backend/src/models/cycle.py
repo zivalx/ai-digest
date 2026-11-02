@@ -45,6 +45,7 @@ class Cycle(Base):
     # Relationships
     collected_data = relationship("CollectedData", back_populates="cycle", cascade="all, delete-orphan")
     summaries = relationship("Summary", back_populates="cycle", cascade="all, delete-orphan")
+    extracted_mentions = relationship("ExtractedMention", back_populates="cycle", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Cycle(id={self.id}, name={self.name}, status={self.status})>"
