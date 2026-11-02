@@ -25,6 +25,7 @@ from ..models import Cycle, CollectedData, ExtractedMention, SourceConfig
 from ..models.cycle import CycleStatus
 from .collection_orchestrator import CollectionOrchestrator
 from .extraction_service import ExtractionService
+from .timestamps import normalize_published
 from .trender_client import TrenderClient
 
 logger = logging.getLogger(__name__)
@@ -253,16 +254,22 @@ class SchedulerService:
 
     @staticmethod
     def _to_extraction_item(item: Dict[str, Any], source_type: str) -> Dict[str, Any]:
-        """Map a raw connector item to the ExtractionService input shape."""
+        """Map a raw connector item to the ExtractionService input shape.
+
+        ``ts`` is always ISO-8601 UTC (or None) — see ``normalize_published``.
+        """
         if source_type == "telegram":
+            ts, precision = normalize_published(item.get("date") or item.get("ts"))
             return {
                 "source": "telegram",
                 "transcript": item.get("text"),
                 "message_link": item.get("message_link") or item.get("link"),
                 "channel": item.get("channel"),
-                "ts": item.get("date") or item.get("ts"),
+                "ts": ts,
+                "ts_precision": precision,
             }
         # youtube (and default)
+        ts, precision = normalize_published(item.get("published_at") or item.get("upload_date"))
         return {
             "source": "youtube",
             "transcript": item.get("transcript"),
@@ -271,7 +278,8 @@ class SchedulerService:
             "url": item.get("url"),
             "channel": item.get("channel"),
             "title": item.get("title"),
-            "ts": item.get("published_at") or item.get("upload_date"),
+            "ts": ts,
+            "ts_precision": precision,
         }
 
     async def _store_mentions(self, db, cycle_id, mentions: List[Dict[str, Any]]):
