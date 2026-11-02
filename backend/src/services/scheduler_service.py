@@ -354,7 +354,7 @@ class SchedulerService:
             row.trender_response = response_text
         await db.commit()
 
-    async def _push_calls(self, db, stored) -> None:
+    async def _push_calls(self, db, stored, origin: str = "feeder") -> None:
         """
         Push recommendation calls to trender's track-record endpoint.
 
@@ -366,7 +366,7 @@ class SchedulerService:
         for row, mention in stored:
             if row.pushed_calls_to_trender:
                 continue
-            call = ExtractionService.to_call_payload(mention, "feeder", model)
+            call = ExtractionService.to_call_payload(mention, origin, model)
             if call is not None:
                 to_push.append((row, call))
         if not to_push:
