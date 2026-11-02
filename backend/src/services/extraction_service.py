@@ -32,6 +32,14 @@ MIN_CONFIDENCE = 0.3
 
 _STANCES = {"bullish", "bearish", "neutral"}
 
+# Track-record (recommendation) extraction contract version, sent with each call.
+EXTRACTION_VERSION = "tr-1"
+
+# Must match trender's CallIn enums; an invalid value would 422 the whole batch.
+_ACTIONS = {"buy", "add", "hold", "trim", "sell", "short", "avoid", "watch"}
+_HORIZONS = {"short", "medium", "long"}
+_CALL_SOURCES = {"youtube", "telegram", "twitter"}
+
 # Default quality-first provider order for the extraction fallback chain.
 DEFAULT_LLM_PROVIDERS = "anthropic,xai,deepseek"
 
@@ -68,6 +76,32 @@ class RawPick(BaseModel):
         "discussed. Null if unknown or not a video.",
     )
     quote: str = Field(description="The exact sentence/quote supporting the pick.")
+    is_recommendation: bool = Field(
+        default=False,
+        description="True only if the author makes an actionable call (see action). "
+        "False for a mere mention/discussion. If unsure, false.",
+    )
+    action: Optional[str] = Field(
+        default=None,
+        description="One of: buy, add, hold, trim, sell, short, avoid, watch. "
+        "Null unless is_recommendation is true.",
+    )
+    horizon: Optional[str] = Field(
+        default=None,
+        description="One of: short, medium, long -- only if the author states or "
+        "clearly implies one, else null.",
+    )
+    entry_price: Optional[float] = Field(
+        default=None, description="Entry/buy price the author STATED, else null.")
+    target_price: Optional[float] = Field(
+        default=None, description="Price target the author STATED, else null.")
+    stop_price: Optional[float] = Field(
+        default=None, description="Stop-loss price the author STATED, else null.")
+    trigger_price: Optional[float] = Field(
+        default=None,
+        description="For action=watch: the level that triggers the call "
+        "(e.g. breakout above X), else null.",
+    )
 
 
 class PickList(BaseModel):
@@ -90,7 +124,29 @@ SYSTEM_PROMPT = (
     "- Each transcript line may be prefixed with a [Ns] time marker. Set "
     "start_seconds to the marker nearest where the pick is discussed.\n"
     "- quote must be a verbatim snippet from the text.\n"
-    "- If there are no genuine picks, return an empty list."
+    "- If there are no genuine picks, return an empty list.\n\n"
+    "Recommendations vs mentions:\n"
+    "- Set is_recommendation=true ONLY when the author makes an actionable call on "
+    "the ticker: says they buy/bought/hold/sell/sold it, or recommends doing so, or "
+    "gives a conditional trade plan. Merely discussing a stock (its earnings, why it "
+    "moved today, a chart description, news) is a mention: is_recommendation=false "
+    "and action=null.\n"
+    "- If unsure, is_recommendation=false.\n"
+    "- action meanings: buy = recommends buying or says they bought (opens a long); "
+    "add = adding to an existing position; hold = still holding / still likes it; "
+    "trim = partially selling; sell = exits or recommends selling; short = "
+    "recommends shorting / expects a drop; avoid = explicitly says stay away; "
+    "watch = conditional call, e.g. \"if it breaks above X it's a buy\" "
+    "(common in technical analysis; put X in trigger_price).\n"
+    "- Hebrew examples: \"אני קונה\" / \"נכנסתי לפוזיציה\" = buy; \"מוכר\" / "
+    "\"יצאתי\" = sell; \"אם תפרוץ מעל X\" = watch (trigger_price=X). A sentence "
+    "like \"מניית אנבידיה עלתה היום ב-5%\" (the stock rose 5% today) is only a "
+    "mention.\n"
+    "- horizon (short, medium or long) only if stated or clearly implied, else null.\n"
+    "- entry_price, target_price, stop_price, trigger_price: ONLY prices the author "
+    "explicitly states; never estimate or infer them. Otherwise null.\n"
+    "- Return one pick per symbol per item: the author's most decisive statement "
+    "about it. The quote must be that statement."
 )
 
 
@@ -309,6 +365,17 @@ class ExtractionService:
             logger.debug("Dropping pick %s: could not build citation", symbol)
             return None
 
+        action = (raw.action or "").strip().lower() or None
+        horizon = (raw.horizon or "").strip().lower() or None
+        if (action and action not in _ACTIONS) or (horizon and horizon not in _HORIZONS):
+            # Invalid enum: keep the pick for discovery, but never as a call.
+            action = horizon = None
+            is_recommendation = False
+        else:
+            is_recommendation = bool(raw.is_recommendation) and action is not None
+            if not is_recommendation:
+                action = None
+
         context = raw.thesis or ""
         if raw.quote:
             context = f"{context}\n\nQuote: {raw.quote}".strip()
@@ -323,6 +390,64 @@ class ExtractionService:
             "context": context,
             "citation": citation,
             "mentioned_at": self._mentioned_at(item),
+            "is_recommendation": is_recommendation,
+            "action": action,
+            "horizon": horizon,
+            "entry_price": raw.entry_price,
+            "target_price": raw.target_price,
+            "stop_price": raw.stop_price,
+            "trigger_price": raw.trigger_price,
+            "thesis": raw.thesis,
+            "quote": raw.quote,
+            # No now() fallback: a call without a real timestamp can't be scored.
+            "said_at": item.get("ts") or None,
+            "said_at_precision": item.get("ts_precision") or None,
+        }
+
+    @staticmethod
+    def to_call_payload(
+        mention: Dict[str, Any], origin: str, extractor_model: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build trender's track-record ``CallIn`` dict from a mention, or None if the
+        mention is not a scoreable call (not a recommendation, or missing
+        action / said_at / source_item_id / citation.channel / valid source).
+        """
+        if not mention.get("is_recommendation") or not mention.get("action"):
+            return None
+        said_at = mention.get("said_at")
+        if not said_at:
+            return None
+        source = mention.get("source")
+        if source not in _CALL_SOURCES:
+            return None
+        citation = mention.get("citation") or {}
+        source_item_id = (
+            citation.get("video_id") if source == "youtube" else citation.get("message_link")
+        )
+        if not source_item_id or not citation.get("channel"):
+            return None
+        return {
+            "symbol": mention["symbol"],
+            "company_name": mention.get("company_name"),
+            "source": source,
+            "action": mention["action"],
+            "stance": mention.get("stance"),
+            "horizon": mention.get("horizon"),
+            "conviction": mention.get("confidence"),  # pure rename
+            "entry_price": mention.get("entry_price"),
+            "target_price": mention.get("target_price"),
+            "stop_price": mention.get("stop_price"),
+            "trigger_price": mention.get("trigger_price"),
+            "thesis": mention.get("thesis"),
+            "quote": mention.get("quote"),
+            "citation": citation,
+            "source_item_id": source_item_id,
+            "said_at": said_at,
+            "said_at_precision": mention.get("said_at_precision") or "datetime",
+            "origin": origin,
+            "extractor_model": extractor_model,
+            "extraction_version": EXTRACTION_VERSION,
         }
 
     @staticmethod
