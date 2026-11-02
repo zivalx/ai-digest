@@ -4,7 +4,7 @@ Trender Client - pushes extracted mentions and track-record calls to trender.
 POSTs batches to ``{TRENDER_BASE_URL}/api/discovery/mentions`` and
 ``{TRENDER_BASE_URL}/api/track-record/calls``. Sends a bearer
 token when ``TRENDER_INGEST_TOKEN`` is set (Hetzner); open locally. Retries a
-couple of times on network failure with exponential backoff.
+couple of times on network failure or HTTP 5xx with exponential backoff.
 """
 import asyncio
 import logging
@@ -52,7 +52,7 @@ class TrenderClient:
         """
         POST a batch of mention dicts to trender.
 
-        Returns the parsed JSON response. Retries on transport/network errors;
+        Returns the parsed JSON response. Retries on transport errors and 5xx;
         raises :class:`TrenderPushError` if all attempts fail.
         """
         if not mentions:
@@ -78,10 +78,14 @@ class TrenderClient:
         )
 
     async def _post_with_retry(self, path: str, payload: Dict[str, Any], label: str) -> Dict[str, Any]:
-        """POST ``payload`` to ``base_url + path``, retrying transport errors with backoff."""
+        """POST ``payload`` to ``base_url + path``.
+
+        Transport errors and HTTP 5xx are retried with exponential backoff; a 4xx
+        is the server rejecting the batch and fails fast.
+        """
         url = f"{self.base_url}{path}"
 
-        last_error: Optional[Exception] = None
+        last_error: Optional[str] = None
         for attempt in range(self.max_retries + 1):
             try:
                 response = await self._post(url, payload)
@@ -90,29 +94,26 @@ class TrenderClient:
                 logger.info("Pushed %s to trender: %s", label, url)
                 return data
             except (httpx.TransportError, httpx.TimeoutException) as e:
-                last_error = e
-                if attempt < self.max_retries:
-                    delay = self.backoff_base * (2 ** attempt)
-                    logger.warning(
-                        "Push to trender failed (attempt %d/%d): %s; retrying in %.1fs",
-                        attempt + 1,
-                        self.max_retries + 1,
-                        e,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error("Push to trender failed after %d attempts: %s", attempt + 1, e)
+                last_error = str(e)
             except httpx.HTTPStatusError as e:
-                # A 4xx/5xx is a server-side decision, not a transient network fault.
-                logger.error(
-                    "trender rejected the batch: %s %s",
-                    e.response.status_code,
-                    e.response.text[:500],
+                status, body = e.response.status_code, e.response.text[:500]
+                if status < 500:
+                    logger.error("trender rejected the batch: %s %s", status, body)
+                    raise TrenderPushError(f"trender returned {status}: {body}") from e
+                last_error = f"trender returned {status}: {body}"
+
+            if attempt < self.max_retries:
+                delay = self.backoff_base * (2 ** attempt)
+                logger.warning(
+                    "Push to trender failed (attempt %d/%d): %s; retrying in %.1fs",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    last_error,
+                    delay,
                 )
-                raise TrenderPushError(
-                    f"trender returned {e.response.status_code}: {e.response.text[:500]}"
-                ) from e
+                await asyncio.sleep(delay)
+            else:
+                logger.error("Push to trender failed after %d attempts: %s", attempt + 1, last_error)
 
         raise TrenderPushError(f"Failed to push {label} after retries: {last_error}")
 

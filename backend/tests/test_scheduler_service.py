@@ -63,7 +63,7 @@ class FakeExtraction:
                 "mentioned_at": "2026-08-25T12:00:00Z",
                 "is_recommendation": True,
                 "action": "buy",
-                "horizon": "swing",
+                "horizon": "short",
                 "entry_price": 120.5,
                 "target_price": 150,
                 "stop_price": 110,
@@ -241,7 +241,7 @@ async def test_cycle_pushes_calls_only_for_track_record_configs(session_factory)
         assert row.pushed_calls_to_trender is False
         assert row.is_recommendation is True
         assert row.action == "buy"
-        assert row.horizon == "swing"
+        assert row.horizon == "short"
         assert float(row.entry_price) == 120.5
         assert row.said_at == "2026-08-25T11:00:00Z"
         assert row.said_at_precision == "datetime"
@@ -299,3 +299,43 @@ async def test_call_push_failure_leaves_flag_false(session_factory):
         assert row.pushed_to_trender is True
         assert row.pushed_calls_to_trender is False
         assert "calls down" in row.trender_calls_response
+
+
+@pytest.mark.asyncio
+async def test_track_record_cycle_sweeps_previously_failed_calls(session_factory):
+    cfg = await _make_finance_config(session_factory, track_record=True)
+    await _svc(session_factory, FakeExtraction(), FakeTrender(calls_error=RuntimeError("down"))) \
+        .run_finance_cycle(cfg)
+    async with session_factory() as db:
+        row = (await db.execute(select(ExtractedMention))).scalars().one()
+        assert row.pushed_calls_to_trender is False and row.call_payload_json["source_item_id"] == "AAA"
+
+    # Next cycle sees no new items (ledger) but re-sends the stored payload first.
+    extraction, trender = FakeExtraction(), FakeTrender()
+    await _svc(session_factory, extraction, trender).run_finance_cycle(cfg)
+    assert extraction.received == []
+    assert [[c["source_item_id"] for c in batch] for batch in trender.pushed_calls] == [["AAA"]]
+    async with session_factory() as db:
+        row = (await db.execute(select(ExtractedMention))).scalars().one()
+        assert row.pushed_calls_to_trender is True
+
+
+@pytest.mark.asyncio
+async def test_non_track_record_cycle_stores_no_payload_and_does_not_sweep(session_factory):
+    tracked = await _make_finance_config(session_factory, track_record=True)
+    await _svc(session_factory, FakeExtraction(), FakeTrender(calls_error=RuntimeError("down"))) \
+        .run_finance_cycle(tracked)
+
+    plain = await _make_finance_config(session_factory, track_record=False)
+    data = [{"video_id": "BBB", "channel": "@finance", "title": "Two", "transcript": "buy"}]
+    trender = FakeTrender()
+    await SchedulerService(
+        session_factory=session_factory, orchestrator=FakeOrchestrator(data),
+        extraction_service=FakeExtraction(), trender_client=trender,
+    ).run_finance_cycle(plain)
+    assert trender.pushed_calls == []
+    async with session_factory() as db:
+        row = (
+            await db.execute(select(ExtractedMention).where(ExtractedMention.dedupe_key.contains("BBB")))
+        ).scalars().one()
+        assert row.call_payload_json is None

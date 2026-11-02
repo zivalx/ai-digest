@@ -375,15 +375,17 @@ class ExtractionService:
             return None
 
         action = (raw.action or "").strip().lower() or None
+        if action not in _ACTIONS:
+            # Invalid/missing action: keep the pick for discovery, but never as a call.
+            action = None
         horizon = (raw.horizon or "").strip().lower() or None
-        if (action and action not in _ACTIONS) or (horizon and horizon not in _HORIZONS):
-            # Invalid enum: keep the pick for discovery, but never as a call.
-            action = horizon = None
-            is_recommendation = False
-        else:
-            is_recommendation = bool(raw.is_recommendation) and action is not None
-            if not is_recommendation:
-                action = None
+        if horizon not in _HORIZONS:
+            # Invalid horizon drops only the horizon; trender defaults it from the
+            # influencer's style.
+            horizon = None
+        is_recommendation = bool(raw.is_recommendation) and action is not None
+        if not is_recommendation:
+            action = None
 
         context = raw.thesis or ""
         if raw.quote:

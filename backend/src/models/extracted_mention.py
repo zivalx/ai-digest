@@ -55,7 +55,10 @@ class ExtractedMention(Base):
     pushed_to_trender = Column(Boolean, nullable=False, default=False)
     trender_response = Column(Text, nullable=True)
 
-    # Track-record push tracking (trender POST /api/track-record/calls)
+    # Track-record push tracking (trender POST /api/track-record/calls).
+    # call_payload_json is the exact CallIn payload, kept so unpushed / rejected
+    # calls can be re-sent without re-running extraction.
+    call_payload_json = Column(JSON(none_as_null=True), nullable=True)
     pushed_calls_to_trender = Column(Boolean, nullable=False, default=False)
     trender_calls_response = Column(Text, nullable=True)
 

@@ -136,3 +136,34 @@ async def test_push_calls_retry_then_success():
 
     assert resp["accepted"] == 1
     assert attempts["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_push_retries_5xx_then_succeeds():
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return httpx.Response(503, text="unavailable")
+        return httpx.Response(200, json={"accepted": 1, "duplicates": 0, "rejected": []})
+
+    client = _client_with(handler, ingest_token=None, max_retries=2)
+    resp = await client.push_calls(CALLS)
+
+    assert resp["accepted"] == 1
+    assert attempts["n"] == 3  # 2x 503 + 1 success
+
+
+@pytest.mark.asyncio
+async def test_push_raises_after_persistent_5xx():
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(500, text="boom")
+
+    client = _client_with(handler, ingest_token=None, max_retries=1)
+    with pytest.raises(TrenderPushError, match="500"):
+        await client.push_calls(CALLS)
+    assert attempts["n"] == 2

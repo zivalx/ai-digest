@@ -11,9 +11,15 @@ NEW videos/messages, so LLM cost is bounded and reruns are cheap. Mentions are
 deduped by ``dedupe_key`` before insert and gated by ``pushed_to_trender`` before
 send, so retries never double-count.
 
+Track-record calls: every extracted recommendation's call payload is stored on
+its mention row (``call_payload_json``, also for rows that already existed), so
+a call whose push failed or that trender rejected (e.g. unmapped channel) is
+re-sent by the sweep at the start of each track-record cycle.
+
 Wiring into app startup is guarded by ``FEEDER_ENABLED`` (default false).
 """
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +46,42 @@ def _iso(value: Any) -> Any:
     if isinstance(value, list):
         return [_iso(v) for v in value]
     return value
+
+
+@dataclass
+class CallPushResult:
+    """Outcome of one call push, from trender's ``{accepted, duplicates, rejected}``."""
+
+    sent: int = 0
+    accepted: int = 0
+    duplicate: int = 0
+    rejected: Dict[str, int] = field(default_factory=dict)  # reason -> count
+    failed: int = 0  # transport / HTTP failures (left unpushed)
+
+    @property
+    def pushed(self) -> int:
+        return self.accepted + self.duplicate
+
+
+def _symbol_unique_batches(rows: List[ExtractedMention]) -> List[List[ExtractedMention]]:
+    """Split rows so no symbol repeats within a request.
+
+    trender identifies rejected calls only by symbol, so this keeps the mapping
+    from a rejection back to its row exact.
+    """
+    batches: List[List[ExtractedMention]] = []
+    symbols: List[set] = []
+    for row in rows:
+        symbol = (row.call_payload_json or {}).get("symbol")
+        for batch, seen in zip(batches, symbols):
+            if symbol not in seen:
+                batch.append(row)
+                seen.add(symbol)
+                break
+        else:
+            batches.append([row])
+            symbols.append({symbol})
+    return batches
 
 
 class SchedulerService:
@@ -146,6 +188,10 @@ class SchedulerService:
             await db.refresh(cycle)
 
             try:
+                # 0. Re-send stored calls that failed or were rejected earlier.
+                if source_config.track_record:
+                    await self.repush_unpushed_calls(db)
+
                 # 1. Collect from the source.
                 result = await self.orchestrator.collect(
                     source_type=source_config.source_type,
@@ -193,7 +239,8 @@ class SchedulerService:
                 # 5. Push to trender, then flag pushed rows.
                 await self._push(db, stored)
                 if source_config.track_record:
-                    await self._push_calls(db, stored)
+                    pending = await self._attach_calls(db, mentions, origin="feeder")
+                    await self._push_calls(db, pending)
 
                 cycle.status = CycleStatus.COMPLETED
                 cycle.completed_at = datetime.now(timezone.utc)
@@ -354,35 +401,106 @@ class SchedulerService:
             row.trender_response = response_text
         await db.commit()
 
-    async def _push_calls(self, db, stored, origin: str = "feeder") -> None:
+    async def _attach_calls(self, db, mentions: List[Dict[str, Any]], origin: str) -> List[ExtractedMention]:
         """
-        Push recommendation calls to trender's track-record endpoint.
+        Store the call payload of every extracted recommendation on its mention
+        row, including rows that already existed (dedupe_key collision), and
+        return the rows whose call still needs pushing.
 
-        Only rows whose mention yields a call payload are sent; others (not
-        recommendations / missing said_at) are never flagged.
+        An existing row keeps its discovery fields and any payload it already
+        has; only a missing payload is filled in.
         """
         model = self.extraction_service.model
-        to_push = []
-        for row, mention in stored:
-            if row.pushed_calls_to_trender:
-                continue
+        payloads: Dict[str, Dict[str, Any]] = {}
+        for mention in mentions:
             call = ExtractionService.to_call_payload(mention, origin, model)
             if call is not None:
-                to_push.append((row, call))
-        if not to_push:
-            return
+                payloads.setdefault(ExtractionService.dedupe_key_for(mention), call)
+        if not payloads:
+            return []
 
-        try:
-            response = await self.trender_client.push_calls([call for _, call in to_push])
-        except Exception as e:  # noqa: BLE001 - record failure, leave flag False
-            logger.error("trender calls push failed for %d call(s): %s", len(to_push), e)
-            for row, _ in to_push:
-                row.trender_calls_response = f"error: {e}"
-            await db.commit()
-            return
+        keys = list(payloads)
+        rows: Dict[str, ExtractedMention] = {}
+        for i in range(0, len(keys), 500):  # stay under DB bind-parameter limits
+            chunk = keys[i:i + 500]
+            found = await db.execute(
+                select(ExtractedMention).where(ExtractedMention.dedupe_key.in_(chunk))
+            )
+            rows.update({row.dedupe_key: row for row in found.scalars().all()})
 
-        response_text = str(response)
-        for row, _ in to_push:
-            row.pushed_calls_to_trender = True
-            row.trender_calls_response = response_text
+        pending = []
+        for key in keys:  # keep extraction order
+            row = rows.get(key)
+            if row is None:
+                continue
+            if row.call_payload_json is None:
+                row.call_payload_json = payloads[key]
+            if not row.pushed_calls_to_trender:
+                pending.append(row)
         await db.commit()
+        return pending
+
+    async def repush_unpushed_calls(self, db) -> CallPushResult:
+        """
+        Re-send every stored call payload not yet accepted by trender (failed
+        push, or rejected e.g. for an unmapped channel). Not scoped to a source
+        config: any unpushed row is retried.
+        """
+        rows = (await db.execute(
+            select(ExtractedMention)
+            .where(
+                ExtractedMention.call_payload_json.is_not(None),
+                ExtractedMention.pushed_calls_to_trender == False,  # noqa: E712
+            )
+            .order_by(ExtractedMention.created_at)
+        )).scalars().all()
+        if rows:
+            logger.info("Re-sending %d unpushed track-record call(s)", len(rows))
+        return await self._push_calls(db, list(rows))
+
+    async def _push_calls(self, db, rows: List[ExtractedMention]) -> CallPushResult:
+        """
+        Push the rows' stored call payloads to trender's track-record endpoint.
+
+        Accepted and duplicate calls are flagged pushed; rejected calls (matched
+        back by symbol, unique per request) and transport/HTTP failures stay
+        unpushed with the response recorded, so the sweep retries them.
+        """
+        result = CallPushResult()
+        for batch in _symbol_unique_batches([r for r in rows if r.call_payload_json]):
+            result.sent += len(batch)
+            try:
+                response = await self.trender_client.push_calls(
+                    [row.call_payload_json for row in batch]
+                )
+            except Exception as e:  # noqa: BLE001 - record failure, leave flag False
+                logger.error("trender calls push failed for %d call(s): %s", len(batch), e)
+                result.failed += len(batch)
+                for row in batch:
+                    row.trender_calls_response = f"error: {e}"
+                await db.commit()
+                continue
+
+            response = response if isinstance(response, dict) else {}
+            rejected: Dict[str, str] = {}
+            for entry in response.get("rejected") or []:
+                reason = entry.get("reason") or "unknown"
+                rejected[entry.get("symbol")] = reason
+                result.rejected[reason] = result.rejected.get(reason, 0) + 1
+            duplicates = int(response.get("duplicates") or 0)
+            result.duplicate += duplicates
+            result.accepted += int(response.get("accepted", len(batch) - duplicates - len(rejected)))
+
+            text = str(response)
+            for row in batch:
+                reason = rejected.get(row.call_payload_json.get("symbol"))
+                if reason is None:
+                    row.pushed_calls_to_trender = True
+                    row.trender_calls_response = text
+                else:
+                    row.trender_calls_response = f"rejected: {reason}; {text}"
+            await db.commit()
+
+        if result.rejected:
+            logger.warning("trender rejected track-record call(s): %s", result.rejected)
+        return result

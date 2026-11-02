@@ -5,9 +5,10 @@ import uuid
 from datetime import date, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from src.models import Cycle, ExtractedMention, SourceConfig, TrackRecordProcessed
+from src.models.cycle import CycleStatus
 from src.services.backfill_service import BackfillService, estimate_cost
 from src.services.extraction_service import EXTRACTION_VERSION
 
@@ -25,10 +26,11 @@ class FakeOrchestrator:
 class FakeExtraction:
     model = "fake-model"
 
-    def __init__(self, fail_ids=(), raise_all=False):
+    def __init__(self, fail_ids=(), raise_all=False, symbols=None):
         self.received = []
         self.fail_ids = set(fail_ids)
         self.raise_all = raise_all
+        self.symbols = symbols or {}  # video_id -> symbol (default NVDA)
 
     async def extract(self, items, on_error=None):
         if self.raise_all:
@@ -41,7 +43,7 @@ class FakeExtraction:
                 on_error(it, RuntimeError("boom"))
                 continue
             out.append({
-                "symbol": "NVDA", "company_name": "NVIDIA", "source": "youtube",
+                "symbol": self.symbols.get(vid, "NVDA"), "company_name": "NVIDIA", "source": "youtube",
                 "stance": "bullish", "sentiment_score": 0.7, "confidence": 0.8,
                 "context": "thesis",
                 "citation": {
@@ -49,7 +51,7 @@ class FakeExtraction:
                     "video_id": vid, "channel": it.get("channel"),
                     "title": it.get("title"), "start_seconds": 10,
                 },
-                "is_recommendation": True, "action": "buy", "horizon": "swing",
+                "is_recommendation": True, "action": "buy", "horizon": "short",
                 "thesis": "thesis", "quote": "buy it",
                 "said_at": "2026-01-05T10:00:00Z", "said_at_precision": "datetime",
             })
@@ -57,8 +59,12 @@ class FakeExtraction:
 
 
 class FakeTrender:
-    def __init__(self, calls_error=None):
+    """Mimics trender's ingest response: {accepted, duplicates, rejected:[{symbol, reason}]}."""
+
+    def __init__(self, calls_error=None, reject=None, duplicates=False):
         self.calls_error = calls_error
+        self.reject = reject or {}  # symbol -> reason
+        self.duplicates = duplicates
         self.pushed_mentions = []
         self.pushed_calls = []
 
@@ -70,12 +76,22 @@ class FakeTrender:
         if self.calls_error:
             raise self.calls_error
         self.pushed_calls.append(calls)
-        return {"accepted": len(calls)}
+        rejected = [{"symbol": c["symbol"], "reason": self.reject[c["symbol"]]}
+                    for c in calls if c["symbol"] in self.reject]
+        ok = len(calls) - len(rejected)
+        return {"accepted": 0 if self.duplicates else ok,
+                "duplicates": ok if self.duplicates else 0, "rejected": rejected}
+
+
+def _days_ago(n):
+    return f"{(date.today() - timedelta(days=n)).isoformat()}T12:00:00Z"
 
 
 DATA = [
-    {"video_id": "AAA", "channel": "@fin", "title": "One", "transcript": "a" * 400},
-    {"video_id": "BBB", "channel": "@fin", "title": "Two", "transcript": "b" * 400},
+    {"video_id": "AAA", "channel": "@fin", "title": "One", "transcript": "a" * 400,
+     "published_at": _days_ago(10), "status": "success"},
+    {"video_id": "BBB", "channel": "@fin", "title": "Two", "transcript": "b" * 400,
+     "published_at": _days_ago(20), "status": "success"},
 ]
 
 
@@ -212,6 +228,9 @@ async def test_push_failure_is_reported_not_blocking(session_factory):
     report = await _run(svc)
     assert report.calls_failed == 2 and report.calls_pushed == 0 and report.mentions_failed == 0
     assert len(await _ledger(session_factory)) == 2
+    async with session_factory() as db:  # payload kept for the retry sweep
+        rows = (await db.execute(select(ExtractedMention))).scalars().all()
+    assert all(r.call_payload_json and not r.pushed_calls_to_trender for r in rows)
 
 
 @pytest.mark.asyncio
@@ -233,3 +252,145 @@ async def test_duplicate_item_ids_are_deduped(session_factory):
     report = await _run(svc)
     assert report.items_found == 3 and report.items_new == 2 and len(ext.received) == 2
     assert len(await _ledger(session_factory)) == 2
+
+
+async def _mentions(session_factory):
+    async with session_factory() as db:
+        return (await db.execute(select(ExtractedMention))).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_rerun_after_version_bump_pushes_calls_for_existing_mentions(session_factory):
+    """C1 (probe_backfill.py): run 1's call push fails; after a version bump the
+    re-run collides on every dedupe_key and must still push the calls."""
+    await _config(session_factory)
+    svc1, *_ = _svc(session_factory, trender=FakeTrender(calls_error=RuntimeError("down")))
+    r1 = await _run(svc1)
+    assert r1.calls_failed == 2
+    async with session_factory() as db:  # simulate EXTRACTION_VERSION bump
+        await db.execute(delete(TrackRecordProcessed))
+        await db.commit()
+
+    svc2, _, ext2, trender2 = _svc(session_factory)
+    r2 = await _run(svc2)
+    assert r2.items_new == 2 and len(ext2.received) == 2
+    assert sum(len(b) for b in trender2.pushed_calls) == 2
+    assert r2.calls_pushed == 2 and r2.calls_accepted == 2 and r2.calls_failed == 0
+    rows = await _mentions(session_factory)
+    assert len(rows) == 2 and all(r.pushed_calls_to_trender for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_backfill_over_feeder_seen_items_attaches_and_pushes_calls(session_factory):
+    """Pre-existing mention rows (e.g. from a non-track-record feeder run) get the
+    call payload attached without overwriting discovery fields, and are pushed."""
+    await _config(session_factory)
+    async with session_factory() as db:
+        cycle = Cycle(name="finance-feeder:other", status=CycleStatus.COMPLETED, config_snapshot={})
+        db.add(cycle)
+        await db.commit()
+        for vid in ("AAA", "BBB"):
+            db.add(ExtractedMention(
+                cycle_id=cycle.id, symbol="NVDA", thesis="feeder thesis", stance="bullish",
+                citation_json={"video_id": vid}, dedupe_key=f"NVDA|https://youtu.be/{vid}?t=10|10",
+                pushed_to_trender=True, pushed_calls_to_trender=False,
+            ))
+            db.add(TrackRecordProcessed(source_type="youtube", item_id=vid, extraction_version="tr-0"))
+        await db.commit()
+
+    svc, _, _, trender = _svc(session_factory)
+    report = await _run(svc)
+    assert report.calls_pushed == 2
+    assert {c["source_item_id"] for b in trender.pushed_calls for c in b} == {"AAA", "BBB"}
+    assert trender.pushed_mentions == []  # discovery mentions were already pushed
+    rows = await _mentions(session_factory)
+    assert len(rows) == 2
+    assert all(r.pushed_calls_to_trender and r.call_payload_json["origin"] == "backfill" for r in rows)
+    assert all(r.thesis == "feeder thesis" for r in rows)  # discovery fields untouched
+
+
+@pytest.mark.asyncio
+async def test_repush_resends_failed_calls_and_marks_pushed(session_factory):
+    await _config(session_factory)
+    svc1, *_ = _svc(session_factory, trender=FakeTrender(calls_error=RuntimeError("down")))
+    await _run(svc1)
+
+    svc2, orch2, ext2, trender2 = _svc(session_factory)
+    result = await svc2.repush()
+    assert orch2.specs == [] and ext2.received == []  # no collection, no LLM
+    assert result.accepted == 2 and result.failed == 0 and result.rejected == {}
+    assert sum(len(b) for b in trender2.pushed_calls) == 2
+    assert all(r.pushed_calls_to_trender for r in await _mentions(session_factory))
+    assert (await svc2.repush()).sent == 0  # nothing left
+
+
+@pytest.mark.asyncio
+async def test_rejected_calls_stay_unpushed_and_are_counted_by_reason(session_factory):
+    await _config(session_factory)
+    trender = FakeTrender(reject={"NVDA": "unmapped channel"})
+    svc, *_ = _svc(session_factory, trender=trender)
+    report = await _run(svc)
+    assert report.calls_rejected == {"unmapped channel": 2}
+    assert report.calls_pushed == 0 and report.calls_accepted == 0 and report.calls_failed == 0
+    # Same symbol twice -> separate requests, so rejections map to exact rows.
+    assert [len(b) for b in trender.pushed_calls] == [1, 1]
+    rows = await _mentions(session_factory)
+    assert all(not r.pushed_calls_to_trender for r in rows)
+    assert all("unmapped channel" in r.trender_calls_response for r in rows)
+    assert len(await _ledger(session_factory)) == 2  # extraction done; call retryable via sweep
+
+
+@pytest.mark.asyncio
+async def test_partial_rejection_marks_only_accepted_rows(session_factory):
+    await _config(session_factory)
+    trender = FakeTrender(reject={"ZZZZ": "unknown symbol"})
+    svc, *_ = _svc(session_factory, ext=FakeExtraction(symbols={"BBB": "ZZZZ"}), trender=trender)
+    report = await _run(svc)
+    assert report.calls_accepted == 1 and report.calls_rejected == {"unknown symbol": 1}
+    pushed = {r.symbol: r.pushed_calls_to_trender for r in await _mentions(session_factory)}
+    assert pushed == {"NVDA": True, "ZZZZ": False}
+
+
+@pytest.mark.asyncio
+async def test_duplicates_count_as_pushed(session_factory):
+    await _config(session_factory)
+    svc, *_ = _svc(session_factory, trender=FakeTrender(duplicates=True))
+    report = await _run(svc)
+    assert report.calls_duplicate == 2 and report.calls_pushed == 2
+    assert all(r.pushed_calls_to_trender for r in await _mentions(session_factory))
+
+
+@pytest.mark.asyncio
+async def test_failed_or_empty_items_are_unavailable_and_never_ledgered(session_factory):
+    await _config(session_factory)
+    data = DATA + [
+        {"video_id": "FFF", "title": "Rate limited", "status": "failed", "error": "429 Too Many",
+         "transcript": "", "published_at": None},
+        {"video_id": "EEE", "title": "No captions", "status": "success", "transcript": "",
+         "published_at": _days_ago(5)},
+    ]
+    svc, _, ext, _ = _svc(session_factory, data=data)
+    report = await _run(svc)
+    assert report.items_found == 4 and report.items_new == 2
+    assert [e["video_id"] for e in ext.received] == ["AAA", "BBB"]
+    assert {(u["id"], u["title"]) for u in report.unavailable} == {
+        ("FFF", "Rate limited"), ("EEE", "No captions")}
+    reasons = {u["id"]: u["reason"] for u in report.unavailable}
+    assert "429" in reasons["FFF"] and reasons["EEE"] == "no transcript"
+    assert {r.item_id for r in await _ledger(session_factory)} == {"AAA", "BBB"}
+
+
+@pytest.mark.asyncio
+async def test_since_filters_by_publish_time(session_factory):
+    await _config(session_factory)
+    data = [
+        {**DATA[0], "published_at": _days_ago(10)},
+        {**DATA[1], "published_at": None, "upload_date": (date.today() - timedelta(days=50)).strftime("%Y%m%d")},
+        {"video_id": "OLD", "title": "Old", "transcript": "x" * 40, "status": "success",
+         "published_at": _days_ago(400)},
+        {"video_id": "NOTS", "title": "No time", "transcript": "x" * 40, "status": "success"},
+    ]
+    svc, _, ext, _ = _svc(session_factory, data=data)
+    report = await _run(svc, since=date.today() - timedelta(days=60), dry_run=True)
+    assert [i["id"] for i in report.items] == ["AAA", "BBB"]
+    assert report.unavailable == [{"id": "NOTS", "title": "No time", "reason": "no publish time"}]

@@ -317,13 +317,20 @@ async def test_said_at_has_no_now_fallback():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("over", [{"action": "moon"}, {"horizon": "forever"}])
-async def test_invalid_action_downgrades_to_mention(over):
-    (m,) = await _extract_one(_rec_pick(**over))
+async def test_invalid_action_downgrades_to_mention():
+    (m,) = await _extract_one(_rec_pick(action="moon"))
     assert m["symbol"] == "NVDA"  # still goes to discovery
     assert m["is_recommendation"] is False
     assert m["action"] is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_horizon_nulls_only_horizon():
+    # trender defaults the horizon from the influencer's style.
+    (m,) = await _extract_one(_rec_pick(horizon="forever"))
     assert m["horizon"] is None
+    assert m["is_recommendation"] is True and m["action"] == "buy"
+    assert ExtractionService.to_call_payload(m, "feeder", "x")["horizon"] is None
 
 
 @pytest.mark.asyncio
@@ -397,3 +404,44 @@ def test_system_prompt_covers_recommendations():
     from src.services.extraction_service import SYSTEM_PROMPT
     for needle in ("is_recommendation", "watch", "אני קונה", "מוכר", "אם תפרוץ", "false"):
         assert needle in SYSTEM_PROMPT
+
+
+# Contract with trender's ``CallIn`` (trender: app/api/track_record.py, enums in
+# app/track_record/models.py). Hard-coded on purpose: a drift here means the
+# ingest endpoint would 422 the whole batch.
+CALLIN_KEYS = {
+    "symbol", "company_name", "source", "action", "stance", "horizon", "conviction",
+    "entry_price", "target_price", "stop_price", "trigger_price", "thesis", "quote",
+    "citation", "source_item_id", "said_at", "said_at_precision", "origin",
+    "extractor_model", "extraction_version",
+}
+CALLIN_ACTIONS = {"buy", "add", "hold", "trim", "sell", "short", "avoid", "watch"}  # CallAction
+CALLIN_HORIZONS = {"short", "medium", "long"}  # Horizon
+CALLIN_SOURCES = {"youtube", "telegram", "twitter"}
+CALLIN_PRECISIONS = {"datetime", "date"}
+CALLIN_ORIGINS = {"feeder", "backfill"}
+
+
+def test_extraction_enums_are_subsets_of_trender_callin():
+    from src.services.extraction_service import _ACTIONS, _HORIZONS
+    assert _ACTIONS <= CALLIN_ACTIONS
+    assert _HORIZONS <= CALLIN_HORIZONS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", sorted(CALLIN_ORIGINS))
+async def test_to_call_payload_matches_trender_callin_contract(origin):
+    (yt,) = await _extract_one(_rec_pick())
+    (tg,) = await _extract_one(_rec_pick(action="sell", horizon=None), {
+        "source": "telegram", "message_link": "https://t.me/c/1", "channel": "noam",
+        "text": "x", "ts": "2026-10-01T00:00:00Z", "ts_precision": "date"})
+    for m in (yt, tg):
+        p = ExtractionService.to_call_payload(m, origin, "claude-x")
+        assert set(p) == CALLIN_KEYS
+        assert p["action"] in CALLIN_ACTIONS
+        assert p["horizon"] is None or p["horizon"] in CALLIN_HORIZONS
+        assert p["source"] in CALLIN_SOURCES
+        assert p["said_at_precision"] in CALLIN_PRECISIONS
+        assert p["origin"] in CALLIN_ORIGINS
+        assert 0 <= p["conviction"] <= 1
+        assert p["citation"].get("channel")
