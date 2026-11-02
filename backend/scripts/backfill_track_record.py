@@ -2,6 +2,9 @@
 """
 Backfill the influencer track record from a channel's back catalog.
 
+Note: Whisper transcription fallback is not supported by the collectors
+library yet, so there is no --whisper flag.
+
 Usage (from backend/):
     python scripts/backfill_track_record.py --source-config "Finance YT" --dry-run
     python scripts/backfill_track_record.py --source-config "Finance YT" --since 2025-01-01 --limit 100
@@ -31,7 +34,6 @@ def parse_args(argv=None):
     p.add_argument("--dry-run", action="store_true", help="estimate only; no LLM, no pushes")
     p.add_argument("--usd-per-mtok", type=float,
                    default=float(os.getenv("BACKFILL_USD_PER_MTOK", "3.0")))
-    p.add_argument("--whisper", action="store_true", help="enable whisper transcription fallback")
     return p.parse_args(argv)
 
 
@@ -40,9 +42,6 @@ def confirm(message: str) -> bool:
 
 
 async def main(args) -> None:
-    if args.whisper:
-        # TODO: the collector has no whisper-fallback pass-through yet.
-        print("warning: --whisper is not wired into the YouTube collector yet; ignoring")
     service = BackfillService(
         CollectionOrchestrator(), ExtractionService(), TrenderClient(),
         AsyncSessionLocal, usd_per_mtok=args.usd_per_mtok,
@@ -50,7 +49,19 @@ async def main(args) -> None:
     report = await service.run(
         args.source_config, args.since, args.limit, args.dry_run, confirm
     )
-    print(report)
+    for it in report.items:
+        print(f"  {it['id']}  {it['published'] or '-'}  {it['transcript_chars']} chars  {it['title'] or ''}")
+    print(
+        f"{report.items_new} new items, ~{report.est_input_tokens} input tokens, "
+        f"~${report.est_cost_usd:.2f} (lower bound: transcript tokens only)"
+    )
+    if report.mentions_failed or report.calls_failed:
+        print(
+            f"WARNING: {report.mentions_failed} mention(s) and {report.calls_failed} call(s) "
+            "failed to push to trender; they are stored locally but NOT delivered."
+        )
+    if not report.dry_run:
+        print(f"{report.calls_pushed} call(s) pushed")
 
 
 if __name__ == "__main__":

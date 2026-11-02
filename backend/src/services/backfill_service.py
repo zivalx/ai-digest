@@ -10,7 +10,7 @@ extracts, then pushes mentions to discovery and calls to the track record with
 Mapping/storing/pushing is reused from ``SchedulerService``.
 """
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from ..models import Cycle, SourceConfig, TrackRecordProcessed
 from ..models.cycle import CycleStatus
-from .extraction_service import EXTRACTION_VERSION
+from .extraction_service import EXTRACTION_VERSION, ExtractionService
 from .scheduler_service import SchedulerService
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,9 @@ class BackfillReport:
     est_cost_usd: float
     calls_pushed: int
     dry_run: bool
+    mentions_failed: int = 0
+    calls_failed: int = 0
+    items: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def estimate_cost(items: List[Dict[str, Any]], usd_per_mtok: float) -> Tuple[int, float]:
@@ -95,13 +98,26 @@ class BackfillService:
                 )
             )).scalars().all())
             new_items = []
+            queued: set = set()
             for it in items:
                 item_id = SchedulerService._item_id(it, source_type)
-                if item_id is not None and item_id not in done:
+                if item_id is not None and item_id not in done and item_id not in queued:
+                    queued.add(item_id)
                     new_items.append(it)
 
             tokens, cost = estimate_cost(new_items, self.usd_per_mtok)
-            report = BackfillReport(len(items), len(new_items), tokens, cost, 0, dry_run)
+            listing = [
+                {
+                    "id": SchedulerService._item_id(it, source_type),
+                    "title": it.get("title"),
+                    "published": it.get("published_at") or it.get("upload_date") or it.get("date"),
+                    "transcript_chars": len(it.get("transcript") or it.get("text") or ""),
+                }
+                for it in new_items
+            ]
+            report = BackfillReport(
+                len(items), len(new_items), tokens, cost, 0, dry_run, items=listing
+            )
             summary = (
                 f"{len(items)} item(s) found, {len(new_items)} new for extraction "
                 f"{EXTRACTION_VERSION}; est. {tokens} input tokens (~${cost:.2f})"
@@ -124,21 +140,50 @@ class BackfillService:
             await db.commit()
             await db.refresh(cycle)
 
-            mentions = await self.extraction_service.extract(
-                [self._feeder._to_extraction_item(it, source_type) for it in new_items]
-            )
-            stored = await self._feeder._store_mentions(db, cycle.id, mentions)
-            await self._feeder._push(db, stored)
-            await self._feeder._push_calls(db, stored, origin="backfill")
-            report.calls_pushed = sum(1 for row, _ in stored if row.pushed_calls_to_trender)
+            cycle_id = cycle.id
+            try:
+                ext_items = [self._feeder._to_extraction_item(it, source_type) for it in new_items]
+                raw_by_ext = {id(e): it for e, it in zip(ext_items, new_items)}
+                failed_ids: set = set()
 
-            for it in new_items:
-                db.add(TrackRecordProcessed(
-                    source_type=source_type,
-                    item_id=SchedulerService._item_id(it, source_type),
-                    extraction_version=EXTRACTION_VERSION,
-                ))
-            cycle.status = CycleStatus.COMPLETED
-            cycle.completed_at = datetime.now(timezone.utc)
-            await db.commit()
+                def on_error(ext_item, exc):
+                    raw = raw_by_ext.get(id(ext_item))
+                    if raw is not None:
+                        failed_ids.add(SchedulerService._item_id(raw, source_type))
+
+                mentions = await self.extraction_service.extract(ext_items, on_error=on_error)
+                stored = await self._feeder._store_mentions(db, cycle.id, mentions)
+                await self._feeder._push(db, stored)
+                await self._feeder._push_calls(db, stored, origin="backfill")
+                report.calls_pushed = sum(1 for row, _ in stored if row.pushed_calls_to_trender)
+                report.mentions_failed = sum(1 for row, _ in stored if not row.pushed_to_trender)
+                report.calls_failed = sum(
+                    1 for row, m in stored
+                    if not row.pushed_calls_to_trender
+                    and ExtractionService.to_call_payload(m, "backfill", self.extraction_service.model)
+                    is not None
+                )
+
+                # Failed items get no ledger row so the next run retries them.
+                for listed in listing:
+                    if listed["id"] in failed_ids:
+                        continue
+                    db.add(TrackRecordProcessed(
+                        source_type=source_type,
+                        item_id=listed["id"],
+                        extraction_version=EXTRACTION_VERSION,
+                    ))
+                cycle.status = CycleStatus.COMPLETED
+                cycle.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            except Exception as e:  # noqa: BLE001
+                await db.rollback()
+                fresh = await db.execute(select(Cycle).where(Cycle.id == cycle_id))
+                cycle = fresh.scalar_one()
+                cycle.status = CycleStatus.FAILED
+                cycle.error_message = str(e)
+                cycle.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+                logger.error("Backfill cycle %s failed: %s", cycle_id, e, exc_info=True)
+                raise
             return report

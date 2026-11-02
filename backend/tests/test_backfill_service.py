@@ -7,7 +7,7 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import select
 
-from src.models import ExtractedMention, SourceConfig, TrackRecordProcessed
+from src.models import Cycle, ExtractedMention, SourceConfig, TrackRecordProcessed
 from src.services.backfill_service import BackfillService, estimate_cost
 from src.services.extraction_service import EXTRACTION_VERSION
 
@@ -25,14 +25,21 @@ class FakeOrchestrator:
 class FakeExtraction:
     model = "fake-model"
 
-    def __init__(self):
+    def __init__(self, fail_ids=(), raise_all=False):
         self.received = []
+        self.fail_ids = set(fail_ids)
+        self.raise_all = raise_all
 
-    async def extract(self, items):
+    async def extract(self, items, on_error=None):
+        if self.raise_all:
+            raise RuntimeError("llm down")
         self.received.extend(items)
         out = []
         for it in items:
             vid = it["video_id"]
+            if vid in self.fail_ids:
+                on_error(it, RuntimeError("boom"))
+                continue
             out.append({
                 "symbol": "NVDA", "company_name": "NVIDIA", "source": "youtube",
                 "stance": "bullish", "sentiment_score": 0.7, "confidence": 0.8,
@@ -50,7 +57,8 @@ class FakeExtraction:
 
 
 class FakeTrender:
-    def __init__(self):
+    def __init__(self, calls_error=None):
+        self.calls_error = calls_error
         self.pushed_mentions = []
         self.pushed_calls = []
 
@@ -59,6 +67,8 @@ class FakeTrender:
         return {"accepted": len(mentions)}
 
     async def push_calls(self, calls):
+        if self.calls_error:
+            raise self.calls_error
         self.pushed_calls.append(calls)
         return {"accepted": len(calls)}
 
@@ -80,8 +90,8 @@ async def _config(session_factory, source_type="youtube"):
         await db.commit()
 
 
-def _svc(session_factory, data=DATA):
-    orch, ext, trender = FakeOrchestrator(data), FakeExtraction(), FakeTrender()
+def _svc(session_factory, data=DATA, ext=None, trender=None):
+    orch, ext, trender = FakeOrchestrator(data), ext or FakeExtraction(), trender or FakeTrender()
     return BackfillService(orch, ext, trender, session_factory), orch, ext, trender
 
 
@@ -171,3 +181,55 @@ async def test_declined_confirmation_aborts(session_factory):
     report = await _run(svc, confirm=lambda m: False)
     assert report.calls_pushed == 0 and ext.received == []
     assert trender.pushed_calls == [] and await _ledger(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_dry_run_lists_items(session_factory):
+    await _config(session_factory)
+    svc, *_ = _svc(session_factory)
+    report = await _run(svc, dry_run=True)
+    assert [i["id"] for i in report.items] == ["AAA", "BBB"]
+    assert report.items[0]["transcript_chars"] == 400 and report.items[0]["title"] == "One"
+
+
+@pytest.mark.asyncio
+async def test_failed_extraction_is_not_ledgered_and_retried(session_factory):
+    await _config(session_factory)
+    svc, _, ext, _ = _svc(session_factory, ext=FakeExtraction(fail_ids={"BBB"}))
+    await _run(svc)
+    assert [r.item_id for r in await _ledger(session_factory)] == ["AAA"]
+    ext.fail_ids.clear()
+    ext.received.clear()
+    report = await _run(svc)
+    assert report.items_new == 1 and [e["video_id"] for e in ext.received] == ["BBB"]
+    assert {r.item_id for r in await _ledger(session_factory)} == {"AAA", "BBB"}
+
+
+@pytest.mark.asyncio
+async def test_push_failure_is_reported_not_blocking(session_factory):
+    await _config(session_factory)
+    svc, *_ = _svc(session_factory, trender=FakeTrender(calls_error=RuntimeError("down")))
+    report = await _run(svc)
+    assert report.calls_failed == 2 and report.calls_pushed == 0 and report.mentions_failed == 0
+    assert len(await _ledger(session_factory)) == 2
+
+
+@pytest.mark.asyncio
+async def test_extraction_exception_marks_cycle_failed(session_factory):
+    await _config(session_factory)
+    svc, *_ = _svc(session_factory, ext=FakeExtraction(raise_all=True))
+    with pytest.raises(RuntimeError):
+        await _run(svc)
+    async with session_factory() as db:
+        cycle = (await db.execute(select(Cycle))).scalar_one()
+    assert cycle.status.value == "failed" and "llm down" in cycle.error_message
+    assert await _ledger(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_item_ids_are_deduped(session_factory):
+    await _config(session_factory)
+    svc, _, ext, _ = _svc(session_factory, data=DATA + [DATA[0]])
+    report = await _run(svc)
+    assert report.items_found == 3 and report.items_new == 2 and len(ext.received) == 2
+    assert len(await _ledger(session_factory)) == 2

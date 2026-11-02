@@ -21,7 +21,7 @@ consumer-side in trender.
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -249,7 +249,11 @@ class ExtractionService:
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
-    async def extract(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def extract(
+        self,
+        items: List[Dict[str, Any]],
+        on_error: Optional[Callable[[Dict[str, Any], Exception], None]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Extract picks from a list of collected items.
 
@@ -259,6 +263,9 @@ class ExtractionService:
             - ``transcript_segments``: optional [{"start": float, "text": str}]
             - youtube metadata: ``video_id``, ``url``, ``channel``, ``title``
             - telegram metadata: ``message_link``, ``channel``, ``ts``
+
+        ``on_error(item, exc)`` is called for each item whose LLM call fails
+        (the batch still continues).
 
         Returns a list of mention dicts matching the frozen output contract.
         """
@@ -279,6 +286,8 @@ class ExtractionService:
                 result = await self._invoke(item, transcript_text)
             except Exception as e:  # noqa: BLE001 - one item must not kill the batch
                 logger.error("Extraction failed for item %s: %s", item.get("video_id"), e)
+                if on_error is not None:
+                    on_error(item, e)
                 continue
 
             for raw in result.picks:
