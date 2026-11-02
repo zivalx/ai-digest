@@ -32,8 +32,11 @@ class FakeOrchestrator:
 class FakeExtraction:
     """Records the items it was given; returns one mention per item."""
 
-    def __init__(self):
+    model = "fake-model"
+
+    def __init__(self, said_at="2026-08-25T11:00:00Z"):
         self.received = None
+        self.said_at = said_at
 
     async def extract(self, items):
         self.received = items
@@ -58,20 +61,39 @@ class FakeExtraction:
                     "quote": "q",
                 },
                 "mentioned_at": "2026-08-25T12:00:00Z",
+                "is_recommendation": True,
+                "action": "buy",
+                "horizon": "swing",
+                "entry_price": 120.5,
+                "target_price": 150,
+                "stop_price": 110,
+                "trigger_price": None,
+                "thesis": "thesis",
+                "quote": "q",
+                "said_at": self.said_at,
+                "said_at_precision": "datetime",
             })
         return mentions
 
 
 class FakeTrender:
-    def __init__(self):
+    def __init__(self, calls_error=None):
         self.pushed_payloads = []
+        self.pushed_calls = []
+        self.calls_error = calls_error
+
+    async def push_calls(self, calls):
+        if self.calls_error:
+            raise self.calls_error
+        self.pushed_calls.append(calls)
+        return {"accepted": len(calls), "duplicates": 0, "rejected": []}
 
     async def push_mentions(self, mentions):
         self.pushed_payloads.append(mentions)
         return {"accepted": len(mentions), "rejected": 0}
 
 
-async def _make_finance_config(session_factory):
+async def _make_finance_config(session_factory, track_record=False):
     async with session_factory() as db:
         cfg = SourceConfig(
             id=uuid.uuid4(),
@@ -80,6 +102,7 @@ async def _make_finance_config(session_factory):
             credential_ref="YOUTUBE_API",
             collect_spec={"channels": ["@finance"]},
             purpose="finance",
+            track_record=track_record,
             enabled=True,
         )
         db.add(cfg)
@@ -191,3 +214,88 @@ async def test_dedupe_key_prevents_duplicate_insert(session_factory):
     async with session_factory() as db:
         rows = (await db.execute(select(ExtractedMention))).scalars().all()
         assert len(rows) == 1  # no duplicate
+
+
+DATA_ONE = [{"video_id": "AAA", "channel": "@finance", "title": "One", "transcript": "buy nvda"}]
+
+
+def _svc(session_factory, extraction, trender):
+    return SchedulerService(
+        session_factory=session_factory,
+        orchestrator=FakeOrchestrator(DATA_ONE),
+        extraction_service=extraction,
+        trender_client=trender,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cycle_pushes_calls_only_for_track_record_configs(session_factory):
+    # Non-track-record config: mentions pushed, no calls.
+    plain = await _make_finance_config(session_factory, track_record=False)
+    trender = FakeTrender()
+    await _svc(session_factory, FakeExtraction(), trender).run_finance_cycle(plain)
+    assert len(trender.pushed_payloads) == 1
+    assert trender.pushed_calls == []
+    async with session_factory() as db:
+        row = (await db.execute(select(ExtractedMention))).scalars().one()
+        assert row.pushed_calls_to_trender is False
+        assert row.is_recommendation is True
+        assert row.action == "buy"
+        assert row.horizon == "swing"
+        assert float(row.entry_price) == 120.5
+        assert row.said_at == "2026-08-25T11:00:00Z"
+        assert row.said_at_precision == "datetime"
+        assert row.quote == "q"
+
+    # Track-record config (new video) -> calls pushed with the call payload.
+    tracked = await _make_finance_config(session_factory, track_record=True)
+    data = [{"video_id": "BBB", "channel": "@finance", "title": "Two", "transcript": "buy"}]
+    trender2 = FakeTrender()
+    svc = SchedulerService(
+        session_factory=session_factory,
+        orchestrator=FakeOrchestrator(data),
+        extraction_service=FakeExtraction(),
+        trender_client=trender2,
+    )
+    await svc.run_finance_cycle(tracked)
+    assert len(trender2.pushed_calls) == 1
+    call = trender2.pushed_calls[0][0]
+    assert call["symbol"] == "NVDA"
+    assert call["origin"] == "feeder"
+    assert call["extractor_model"] == "fake-model"
+    assert call["source_item_id"] == "BBB"
+    async with session_factory() as db:
+        row = (
+            await db.execute(select(ExtractedMention).where(ExtractedMention.dedupe_key.contains("BBB")))
+        ).scalars().one()
+        assert row.pushed_calls_to_trender is True
+        assert "accepted" in row.trender_calls_response
+
+
+@pytest.mark.asyncio
+async def test_cycle_skips_calls_without_said_at(session_factory):
+    cfg = await _make_finance_config(session_factory, track_record=True)
+    trender = FakeTrender()
+    await _svc(session_factory, FakeExtraction(said_at=None), trender).run_finance_cycle(cfg)
+
+    assert len(trender.pushed_payloads) == 1  # mention still pushed for discovery
+    assert trender.pushed_calls == []  # no call payload -> nothing sent
+    async with session_factory() as db:
+        row = (await db.execute(select(ExtractedMention))).scalars().one()
+        assert row.pushed_to_trender is True
+        assert row.pushed_calls_to_trender is False
+        assert row.trender_calls_response is None
+
+
+@pytest.mark.asyncio
+async def test_call_push_failure_leaves_flag_false(session_factory):
+    cfg = await _make_finance_config(session_factory, track_record=True)
+    trender = FakeTrender(calls_error=RuntimeError("calls down"))
+    cycle = await _svc(session_factory, FakeExtraction(), trender).run_finance_cycle(cfg)
+
+    assert cycle.status == CycleStatus.COMPLETED  # call-push failure doesn't fail the cycle
+    async with session_factory() as db:
+        row = (await db.execute(select(ExtractedMention))).scalars().one()
+        assert row.pushed_to_trender is True
+        assert row.pushed_calls_to_trender is False
+        assert "calls down" in row.trender_calls_response

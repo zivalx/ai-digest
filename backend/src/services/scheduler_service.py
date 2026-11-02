@@ -192,6 +192,8 @@ class SchedulerService:
 
                 # 5. Push to trender, then flag pushed rows.
                 await self._push(db, stored)
+                if source_config.track_record:
+                    await self._push_calls(db, stored)
 
                 cycle.status = CycleStatus.COMPLETED
                 cycle.completed_at = datetime.now(timezone.utc)
@@ -308,9 +310,20 @@ class SchedulerService:
                 stance=mention.get("stance"),
                 sentiment_score=mention.get("sentiment_score"),
                 confidence=mention.get("confidence"),
+                is_recommendation=bool(mention.get("is_recommendation")),
+                action=mention.get("action"),
+                horizon=mention.get("horizon"),
+                entry_price=mention.get("entry_price"),
+                target_price=mention.get("target_price"),
+                stop_price=mention.get("stop_price"),
+                trigger_price=mention.get("trigger_price"),
+                quote=mention.get("quote"),
+                said_at=mention.get("said_at"),
+                said_at_precision=mention.get("said_at_precision"),
                 citation_json=mention.get("citation", {}) or {},
                 dedupe_key=key,
                 pushed_to_trender=False,
+                pushed_calls_to_trender=False,
             )
             db.add(row)
             stored.append((row, mention))
@@ -339,4 +352,37 @@ class SchedulerService:
         for row, _ in to_push:
             row.pushed_to_trender = True
             row.trender_response = response_text
+        await db.commit()
+
+    async def _push_calls(self, db, stored) -> None:
+        """
+        Push recommendation calls to trender's track-record endpoint.
+
+        Only rows whose mention yields a call payload are sent; others (not
+        recommendations / missing said_at) are never flagged.
+        """
+        model = self.extraction_service.model
+        to_push = []
+        for row, mention in stored:
+            if row.pushed_calls_to_trender:
+                continue
+            call = ExtractionService.to_call_payload(mention, "feeder", model)
+            if call is not None:
+                to_push.append((row, call))
+        if not to_push:
+            return
+
+        try:
+            response = await self.trender_client.push_calls([call for _, call in to_push])
+        except Exception as e:  # noqa: BLE001 - record failure, leave flag False
+            logger.error("trender calls push failed for %d call(s): %s", len(to_push), e)
+            for row, _ in to_push:
+                row.trender_calls_response = f"error: {e}"
+            await db.commit()
+            return
+
+        response_text = str(response)
+        for row, _ in to_push:
+            row.pushed_calls_to_trender = True
+            row.trender_calls_response = response_text
         await db.commit()

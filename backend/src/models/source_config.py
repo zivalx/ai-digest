@@ -34,6 +34,9 @@ class SourceConfig(Base):
     # Pipeline purpose: "general" (default digest) or "finance" (channel-intel feeder)
     purpose = Column(String(50), nullable=False, default="general")
 
+    # Also push recommendations to trender's influencer track record
+    track_record = Column(Boolean, nullable=False, default=False)
+
     # Status
     enabled = Column(Boolean, default=True)
 
