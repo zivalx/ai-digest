@@ -489,3 +489,93 @@ async def test_backfill_rows_do_not_count_as_seen_for_feeder(session_factory):
     feeder = svc._feeder
     async with session_factory() as db:
         assert await feeder._seen_ids(db, "youtube") == set()
+
+
+# ------------------------------------------------- incremental / throttling
+def _item(vid, status="success", transcript="t" * 400, days=10):
+    return {"video_id": vid, "channel": "@fin", "title": vid, "transcript": transcript,
+            "published_at": _days_ago(days), "status": status}
+
+
+@pytest.mark.asyncio
+async def test_first_run_passes_no_skip_ids_and_throttle_defaults(session_factory):
+    await _config(session_factory)
+    svc, orch, *_ = _svc(session_factory)
+    await _run(svc, dry_run=True)
+    spec = orch.specs[0][0]
+    assert "skip_video_ids" not in spec
+    assert spec["max_concurrency"] == 1 and spec["delay_seconds"] == 6
+
+
+@pytest.mark.asyncio
+async def test_collect_spec_throttle_values_beat_defaults_and_overrides_beat_spec(session_factory):
+    async with session_factory() as db:
+        db.add(SourceConfig(
+            id=uuid.uuid4(), name="Fin YT", source_type="youtube", credential_ref="YT",
+            collect_spec={"channels": ["@fin"], "max_concurrency": 2, "delay_seconds": 3},
+            purpose="finance", track_record=True, enabled=True,
+        ))
+        await db.commit()
+    svc, orch, *_ = _svc(session_factory)
+    await _run(svc, dry_run=True)
+    assert (orch.specs[0][0]["max_concurrency"], orch.specs[0][0]["delay_seconds"]) == (2, 3)
+    await svc.run("Fin YT", date.today() - timedelta(days=100), 50, True, lambda m: True,
+                  concurrency=3, delay=0.5, cookies_file="/c.txt")
+    s = orch.specs[1][0]
+    assert (s["max_concurrency"], s["delay_seconds"], s["cookies_file"]) == (3, 0.5, "/c.txt")
+
+
+@pytest.mark.asyncio
+async def test_second_run_skips_stored_successful_and_retries_failed(session_factory):
+    await _config(session_factory)
+    first = [_item("AAA"), _item("BBB", status="failed", transcript=""), _item("CCC", transcript="")]
+    svc1, *_ = _svc(session_factory, data=first)
+    await _run(svc1, dry_run=True)
+
+    svc2, orch2, *_ = _svc(session_factory, data=[_item("BBB")])
+    await _run(svc2, dry_run=True)
+    assert orch2.specs[0][0]["skip_video_ids"] == ["AAA"]
+
+
+@pytest.mark.asyncio
+async def test_merge_stored_and_new_and_persist_only_new(session_factory):
+    await _config(session_factory)
+    svc1, *_ = _svc(session_factory, data=[_item("AAA")])
+    await _run(svc1, dry_run=True)
+
+    svc2, orch2, ext2, _ = _svc(session_factory, data=[_item("NEW", days=5)])
+    report = await _run(svc2)
+    assert report.items_found == 2 and report.items_new == 2
+    assert sorted(e["video_id"] for e in ext2.received) == ["AAA", "NEW"]
+    rows, _ = await _collected(session_factory)
+    assert len(rows) == 2
+    assert sorted(len(r.data) for r in rows) == [1, 1]  # archive not duplicated
+    assert sorted(r.item_count for r in rows) == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_new_item_wins_on_id_clash(session_factory):
+    await _config(session_factory)
+    old = _item("AAA")
+    old["title"] = "old"
+    svc1, *_ = _svc(session_factory, data=[old])
+    await _run(svc1, dry_run=True)
+    new = _item("AAA")
+    new["title"] = "new"
+    svc2, _, ext2, _ = _svc(session_factory, data=[new])
+    await _run(svc2, dry_run=True)
+    report = await _run(_svc(session_factory, data=[new])[0], dry_run=True)
+    assert [i["title"] for i in report.items] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_from_collected_still_works_with_incremental_rows(session_factory):
+    await _config(session_factory)
+    svc1, *_ = _svc(session_factory, data=[_item("AAA")])
+    await _run(svc1, dry_run=True)
+    svc2, *_ = _svc(session_factory, data=[_item("BBB")])
+    await _run(svc2, dry_run=True)
+    svc3, orch3, ext3, _ = _svc(session_factory, data=[])
+    report = await svc3.run("Fin YT", date.today() - timedelta(days=100), 50, False,
+                            lambda m: True, reuse_collected=True)
+    assert orch3.specs == [] and report.items_found == 2

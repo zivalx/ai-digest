@@ -39,11 +39,22 @@ def parse_args(argv=None):
     p.add_argument("--from-collected", action="store_true",
                    help="reuse items stored by a previous backfill of this source config "
                         "instead of collecting again")
+    p.add_argument("--concurrency", type=int, default=None,
+                   help="max videos fetched concurrently (overrides collect_spec; default 1)")
+    p.add_argument("--delay", type=float, default=None,
+                   help="seconds to pause before each video fetch, randomized 0.5x-1.5x "
+                        "(overrides collect_spec; default 6)")
+    p.add_argument("--cookies", metavar="FILE", default=None,
+                   help="Netscape cookies.txt for YouTube (overrides collect_spec cookies_file)")
     p.add_argument("--repush", action="store_true",
                    help="only re-send stored calls trender has not accepted (no collection, no LLM)")
     args = p.parse_args(argv)
     if not args.repush and not args.source_config:
         p.error("--source-config is required unless --repush")
+    if args.concurrency is not None and args.concurrency < 1:
+        p.error("--concurrency must be >= 1")
+    if args.delay is not None and args.delay < 0:
+        p.error("--delay must be >= 0")
     return args
 
 
@@ -82,6 +93,7 @@ async def main(args) -> None:
     report = await service.run(
         args.source_config, args.since, args.limit, args.dry_run, confirm,
         reuse_collected=args.from_collected,
+        concurrency=args.concurrency, delay=args.delay, cookies_file=args.cookies,
     )
     for it in report.items:
         print(f"  {it['id']}  {it['published'] or '-'}  {it['transcript_chars']} chars  {it['title'] or ''}")

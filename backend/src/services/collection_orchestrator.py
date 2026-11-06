@@ -194,16 +194,39 @@ class CollectionOrchestrator:
         """Collect from YouTube using connectors library."""
         from connectors.youtube import YouTubeCollector, YouTubeClientConfig, YouTubeCollectSpec
 
-        # Build client config
-        config = YouTubeClientConfig(
+        # Build client config. Throttling keys are only passed when present so
+        # older connector versions keep working.
+        config_kwargs = dict(
             whisper_model=collect_spec.get("whisper_model", "base"),
             use_transcript_api=collect_spec.get("use_transcript_api", True),
             transcript_languages=collect_spec.get("transcript_languages", ["en"]),
             max_video_length=collect_spec.get("max_video_length", 3600),
         )
+        throttle_kwargs = {
+            k: collect_spec[k]
+            for k in ("max_concurrency", "delay_seconds", "cookies_file")
+            if collect_spec.get(k) is not None
+        }
+        try:
+            config = YouTubeClientConfig(**config_kwargs, **throttle_kwargs)
+        except (TypeError, ValueError) as e:
+            if not throttle_kwargs:
+                raise
+            self.logger.warning(
+                f"Installed connectors YouTubeClientConfig rejected {sorted(throttle_kwargs)} "
+                f"({e}); falling back without throttling options"
+            )
+            config = YouTubeClientConfig(**config_kwargs)
+        if throttle_kwargs and not all(
+            hasattr(config, k) for k in throttle_kwargs
+        ):
+            self.logger.warning(
+                "Installed connectors lacks YouTube throttling options "
+                f"{sorted(k for k in throttle_kwargs if not hasattr(config, k))}; ignored"
+            )
 
         # Build collect spec
-        spec = YouTubeCollectSpec(
+        spec_kwargs = dict(
             channels=collect_spec.get("channels", []),
             max_videos_per_channel=(
                 collect_spec.get("max_videos_per_channel")
@@ -211,6 +234,23 @@ class CollectionOrchestrator:
             ),
             days_back=collect_spec.get("days_back", 7),
         )
+        skip_ids = collect_spec.get("skip_video_ids")
+        try:
+            spec = YouTubeCollectSpec(
+                **spec_kwargs, **({"skip_video_ids": skip_ids} if skip_ids else {})
+            )
+        except (TypeError, ValueError) as e:
+            if not skip_ids:
+                raise
+            self.logger.warning(
+                f"Installed connectors YouTubeCollectSpec rejected skip_video_ids ({e}); "
+                "falling back without it"
+            )
+            spec = YouTubeCollectSpec(**spec_kwargs)
+        if skip_ids and not hasattr(spec, "skip_video_ids"):
+            self.logger.warning(
+                "Installed connectors lacks skip_video_ids; already-collected videos will be re-fetched"
+            )
 
         # Collect data
         collector = YouTubeCollector(config)

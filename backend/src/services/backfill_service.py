@@ -20,12 +20,15 @@ Raw collected items (transcripts) are persisted as a ``CollectedData`` row on
 EVERY run (real, dry and declined) under a ``backfill:<config name>`` cycle, so
 the slow collection is never wasted. ``run(reuse_collected=True)`` replays them
 instead of collecting again; ``scripts/export_transcripts.py`` dumps them to
-disk. Dry runs make no LLM calls and no pushes but DO write that one row.
+disk. Collection is incremental: items stored successfully by earlier backfills are
+passed to the collector as ``skip_video_ids`` (never re-fetched) and merged with
+the newly collected ones; only the newly collected items are stored in the new
+row. Dry runs make no LLM calls and no pushes but DO write that one row.
 """
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 
@@ -36,6 +39,9 @@ from .scheduler_service import CallPushResult, SchedulerService, _iso
 from .timestamps import normalize_published
 
 logger = logging.getLogger(__name__)
+
+BACKFILL_DEFAULT_CONCURRENCY = 1
+BACKFILL_DEFAULT_DELAY_SECONDS = 6
 
 
 @dataclass
@@ -111,6 +117,9 @@ class BackfillService:
         dry_run: bool,
         confirm: Callable[[str], bool],
         reuse_collected: bool = False,
+        concurrency: Optional[int] = None,
+        delay: Optional[float] = None,
+        cookies_file: Optional[str] = None,
     ) -> BackfillReport:
         async with self.session_factory() as db:
             config = (await db.execute(
@@ -126,6 +135,16 @@ class BackfillService:
             spec["days_back"] = days_back
             spec["max_videos_per_channel"] = limit
             spec["max_messages"] = limit  # telegram's equivalent (no date filter there)
+            if source_type == "youtube":
+                # Gentle by default: a burst of requests gets the IP blocked.
+                spec.setdefault("max_concurrency", BACKFILL_DEFAULT_CONCURRENCY)
+                spec.setdefault("delay_seconds", BACKFILL_DEFAULT_DELAY_SECONDS)
+                if concurrency is not None:
+                    spec["max_concurrency"] = concurrency
+                if delay is not None:
+                    spec["delay_seconds"] = delay
+                if cookies_file:
+                    spec["cookies_file"] = cookies_file
             cycle = Cycle(
                 name=backfill_cycle_name(source_config_name),
                 status=CycleStatus.COLLECTING,
@@ -142,23 +161,45 @@ class BackfillService:
                 if reuse_collected:
                     items = await self._load_collected(db, source_config_name, source_type)
                 else:
+                    # Incremental: items already collected successfully by earlier
+                    # backfills are not fetched again (only youtube honours the
+                    # skip list); they are merged back in below.
+                    stored_ok = await self._load_collected(
+                        db, source_config_name, source_type, required=False,
+                        successful_only=True,
+                    )
+                    collect_spec = dict(spec)
+                    if source_type == "youtube" and stored_ok:
+                        collect_spec["skip_video_ids"] = [
+                            SchedulerService._item_id(it, source_type) for it in stored_ok
+                        ]
                     result = await self.orchestrator.collect(
                         source_type=source_type,
                         credential_ref=config.credential_ref,
-                        collect_spec=spec,
+                        collect_spec=collect_spec,
                         timeframe_days=days_back,
                     )
-                    items = result.get("data", []) or []
+                    collected = result.get("data", []) or []
+                    new_ids = {SchedulerService._item_id(it, source_type) for it in collected}
+                    items = collected + [
+                        it for it in stored_ok
+                        if SchedulerService._item_id(it, source_type) not in new_ids
+                    ]
+                    if stored_ok:
+                        logger.info(
+                            "Backfill %s: %d newly collected, %d reused from earlier runs",
+                            source_config_name, len(collected), len(items) - len(collected),
+                        )
                     # Persist raw items right away: transcripts are slow to get
                     # and worth keeping even if this run is dry or declined.
-                    raw = _iso(items)
+                    raw = _iso(collected)
                     db.add(CollectedData(
                         cycle_id=cycle_id,
                         source_type=source_type,
                         source_name=SchedulerService._source_name(result),
                         data=raw,
                         data_size_bytes=len(str(raw)),
-                        item_count=len(items),
+                        item_count=len(collected),
                         collection_time_ms=(result.get("metadata") or {}).get("collection_time_ms"),
                     ))
                     await db.commit()
@@ -266,7 +307,10 @@ class BackfillService:
         logger.error("Backfill cycle %s failed: %s", cycle_id, exc, exc_info=True)
 
     @staticmethod
-    async def _load_collected(db, source_config_name: str, source_type: str) -> List[Dict[str, Any]]:
+    async def _load_collected(
+        db, source_config_name: str, source_type: str,
+        required: bool = True, successful_only: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         Items stored by earlier backfills of this source config. Rows are tied to
         the config via their cycle's name (``backfill:<config name>``); merged
@@ -279,6 +323,8 @@ class BackfillService:
             .order_by(Cycle.started_at.desc(), CollectedData.collected_at.desc())
         )).scalars().all()
         rows = [r for r in rows if isinstance(r.data, list) and r.data]
+        if not rows and not required:
+            return []
         if not rows:
             raise ValueError(
                 f"No stored collected data for source config {source_config_name!r}; "
@@ -291,6 +337,11 @@ class BackfillService:
                 item_id = SchedulerService._item_id(it, source_type)
                 if item_id is None or item_id in seen:
                     continue
+                if successful_only and (
+                    it.get("status") == "failed"
+                    or not (it.get("transcript") or it.get("text") or "").strip()
+                ):
+                    continue  # not marked seen: an older successful copy may exist
                 seen.add(item_id)
                 items.append(it)
         return items
