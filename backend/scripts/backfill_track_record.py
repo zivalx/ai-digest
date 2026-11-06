@@ -8,6 +8,7 @@ library yet, so there is no --whisper flag.
 Usage (from backend/):
     python scripts/backfill_track_record.py --source-config "Finance YT" --dry-run
     python scripts/backfill_track_record.py --source-config "Finance YT" --since 2025-01-01 --limit 100
+    python scripts/backfill_track_record.py --source-config "Finance YT" --from-collected  # no re-collection
     python scripts/backfill_track_record.py --repush   # re-send unpushed calls only
 """
 import argparse
@@ -32,9 +33,12 @@ def parse_args(argv=None):
     p.add_argument("--since", type=date.fromisoformat,
                    default=date.today() - timedelta(days=730), help="YYYY-MM-DD (default: today - 730d)")
     p.add_argument("--limit", type=int, default=200, help="max items per channel (default 200)")
-    p.add_argument("--dry-run", action="store_true", help="estimate only; no LLM, no pushes")
+    p.add_argument("--dry-run", action="store_true", help="collect + store raw transcripts and estimate only; no LLM, no pushes")
     p.add_argument("--usd-per-mtok", type=float,
                    default=float(os.getenv("BACKFILL_USD_PER_MTOK", "3.0")))
+    p.add_argument("--from-collected", action="store_true",
+                   help="reuse items stored by a previous backfill of this source config "
+                        "instead of collecting again")
     p.add_argument("--repush", action="store_true",
                    help="only re-send stored calls trender has not accepted (no collection, no LLM)")
     args = p.parse_args(argv)
@@ -76,7 +80,8 @@ async def main(args) -> None:
         return
 
     report = await service.run(
-        args.source_config, args.since, args.limit, args.dry_run, confirm
+        args.source_config, args.since, args.limit, args.dry_run, confirm,
+        reuse_collected=args.from_collected,
     )
     for it in report.items:
         print(f"  {it['id']}  {it['published'] or '-'}  {it['transcript_chars']} chars  {it['title'] or ''}")
@@ -99,4 +104,7 @@ async def main(args) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(parse_args()))
+    try:
+        asyncio.run(main(parse_args()))
+    except ValueError as exc:  # e.g. unknown config, no stored data for --from-collected
+        sys.exit(f"error: {exc}")

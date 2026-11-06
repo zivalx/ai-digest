@@ -15,6 +15,12 @@ channel listing does not filter by date itself).
 Calls are pushed for every extracted recommendation, including picks whose
 mention row already existed; unpushed calls can be re-sent with ``repush()``.
 Mapping/storing/pushing is reused from ``SchedulerService``.
+
+Raw collected items (transcripts) are persisted as a ``CollectedData`` row on
+EVERY run (real, dry and declined) under a ``backfill:<config name>`` cycle, so
+the slow collection is never wasted. ``run(reuse_collected=True)`` replays them
+instead of collecting again; ``scripts/export_transcripts.py`` dumps them to
+disk. Dry runs make no LLM calls and no pushes but DO write that one row.
 """
 import logging
 from dataclasses import dataclass, field
@@ -23,10 +29,10 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from sqlalchemy import select
 
-from ..models import Cycle, SourceConfig, TrackRecordProcessed
+from ..models import CollectedData, Cycle, SourceConfig, TrackRecordProcessed
 from ..models.cycle import CycleStatus
 from .extraction_service import EXTRACTION_VERSION
-from .scheduler_service import CallPushResult, SchedulerService
+from .scheduler_service import CallPushResult, SchedulerService, _iso
 from .timestamps import normalize_published
 
 logger = logging.getLogger(__name__)
@@ -76,6 +82,10 @@ def _unavailable_reason(item: Dict[str, Any], source_type: str, since: date) -> 
     return "", ts[:10] < since.isoformat()
 
 
+def backfill_cycle_name(source_config_name: str) -> str:
+    return f"backfill:{source_config_name}"
+
+
 class BackfillService:
     def __init__(self, orchestrator, extraction_service, trender_client, session_factory,
                  usd_per_mtok: float = 3.0):
@@ -100,6 +110,7 @@ class BackfillService:
         limit: int,
         dry_run: bool,
         confirm: Callable[[str], bool],
+        reuse_collected: bool = False,
     ) -> BackfillReport:
         async with self.session_factory() as db:
             config = (await db.execute(
@@ -115,13 +126,45 @@ class BackfillService:
             spec["days_back"] = days_back
             spec["max_videos_per_channel"] = limit
             spec["max_messages"] = limit  # telegram's equivalent (no date filter there)
-            result = await self.orchestrator.collect(
-                source_type=source_type,
-                credential_ref=config.credential_ref,
-                collect_spec=spec,
-                timeframe_days=days_back,
+            cycle = Cycle(
+                name=backfill_cycle_name(source_config_name),
+                status=CycleStatus.COLLECTING,
+                config_snapshot={"source_type": source_type, "collect_spec": spec,
+                                 "purpose": "backfill"},
+                started_at=datetime.now(timezone.utc),
             )
-            items = result.get("data", []) or []
+            db.add(cycle)
+            await db.commit()
+            await db.refresh(cycle)
+            cycle_id = cycle.id
+
+            try:
+                if reuse_collected:
+                    items = await self._load_collected(db, source_config_name, source_type)
+                else:
+                    result = await self.orchestrator.collect(
+                        source_type=source_type,
+                        credential_ref=config.credential_ref,
+                        collect_spec=spec,
+                        timeframe_days=days_back,
+                    )
+                    items = result.get("data", []) or []
+                    # Persist raw items right away: transcripts are slow to get
+                    # and worth keeping even if this run is dry or declined.
+                    raw = _iso(items)
+                    db.add(CollectedData(
+                        cycle_id=cycle_id,
+                        source_type=source_type,
+                        source_name=SchedulerService._source_name(result),
+                        data=raw,
+                        data_size_bytes=len(str(raw)),
+                        item_count=len(items),
+                        collection_time_ms=(result.get("metadata") or {}).get("collection_time_ms"),
+                    ))
+                    await db.commit()
+            except Exception as e:  # noqa: BLE001
+                await self._fail_cycle(db, cycle_id, e)
+                raise
 
             done = set((await db.execute(
                 select(TrackRecordProcessed.item_id).where(
@@ -163,24 +206,19 @@ class BackfillService:
                 f"est. {tokens} input tokens (~${cost:.2f})"
             )
             logger.info("Backfill %s: %s", source_config_name, summary)
-            if dry_run or not new_items:
-                return report
-            if not confirm(f"{summary}. Proceed?"):
+            proceed = bool(new_items) and not dry_run
+            if proceed and not confirm(f"{summary}. Proceed?"):
                 logger.info("Backfill declined; nothing extracted")
+                proceed = False
+            if not proceed:
+                # Collection-only run: data is stored, nothing extracted/pushed.
+                cycle.status = CycleStatus.COMPLETED
+                cycle.completed_at = datetime.now(timezone.utc)
+                await db.commit()
                 return report
 
-            cycle = Cycle(
-                name=f"backfill:{source_config_name}",
-                status=CycleStatus.SUMMARIZING,
-                config_snapshot={"source_type": source_type, "collect_spec": spec,
-                                 "purpose": "backfill"},
-                started_at=datetime.now(timezone.utc),
-            )
-            db.add(cycle)
+            cycle.status = CycleStatus.SUMMARIZING
             await db.commit()
-            await db.refresh(cycle)
-
-            cycle_id = cycle.id
             try:
                 ext_items = [self._feeder._to_extraction_item(it, source_type) for it in new_items]
                 raw_by_ext = {id(e): it for e, it in zip(ext_items, new_items)}
@@ -212,16 +250,50 @@ class BackfillService:
                 cycle.completed_at = datetime.now(timezone.utc)
                 await db.commit()
             except Exception as e:  # noqa: BLE001
-                await db.rollback()
-                fresh = await db.execute(select(Cycle).where(Cycle.id == cycle_id))
-                cycle = fresh.scalar_one()
-                cycle.status = CycleStatus.FAILED
-                cycle.error_message = str(e)
-                cycle.completed_at = datetime.now(timezone.utc)
-                await db.commit()
-                logger.error("Backfill cycle %s failed: %s", cycle_id, e, exc_info=True)
+                await self._fail_cycle(db, cycle_id, e)
                 raise
             return report
+
+    @staticmethod
+    async def _fail_cycle(db, cycle_id, exc: Exception) -> None:
+        await db.rollback()
+        fresh = await db.execute(select(Cycle).where(Cycle.id == cycle_id))
+        cycle = fresh.scalar_one()
+        cycle.status = CycleStatus.FAILED
+        cycle.error_message = str(exc)
+        cycle.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        logger.error("Backfill cycle %s failed: %s", cycle_id, exc, exc_info=True)
+
+    @staticmethod
+    async def _load_collected(db, source_config_name: str, source_type: str) -> List[Dict[str, Any]]:
+        """
+        Items stored by earlier backfills of this source config. Rows are tied to
+        the config via their cycle's name (``backfill:<config name>``); merged
+        newest-first, deduped by item id (newest wins).
+        """
+        rows = (await db.execute(
+            select(CollectedData)
+            .join(Cycle, Cycle.id == CollectedData.cycle_id)
+            .where(Cycle.name == backfill_cycle_name(source_config_name))
+            .order_by(Cycle.started_at.desc(), CollectedData.collected_at.desc())
+        )).scalars().all()
+        rows = [r for r in rows if isinstance(r.data, list) and r.data]
+        if not rows:
+            raise ValueError(
+                f"No stored collected data for source config {source_config_name!r}; "
+                "run a backfill (or --dry-run) without --from-collected first"
+            )
+        items: List[Dict[str, Any]] = []
+        seen: set = set()
+        for row in rows:
+            for it in row.data:
+                item_id = SchedulerService._item_id(it, source_type)
+                if item_id is None or item_id in seen:
+                    continue
+                seen.add(item_id)
+                items.append(it)
+        return items
 
     async def repush(self) -> CallPushResult:
         """Re-send stored, not-yet-accepted calls only: no collection, no LLM."""

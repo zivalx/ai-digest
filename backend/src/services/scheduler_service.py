@@ -266,7 +266,14 @@ class SchedulerService:
     # ------------------------------------------------------------------ #
     async def _seen_ids(self, db, source_type: str, exclude_cycle_id=None) -> set:
         """Collect all previously-seen item ids for this source from CollectedData."""
-        query = select(CollectedData).where(CollectedData.source_type == source_type)
+        # Backfill rows are archives (possibly of declined/dry runs), not proof an
+        # item was processed, so they don't count as "seen" for the feeder.
+        query = (
+            select(CollectedData)
+            .join(Cycle, Cycle.id == CollectedData.cycle_id)
+            .where(CollectedData.source_type == source_type)
+            .where(Cycle.name.notlike("backfill:%"))
+        )
         if exclude_cycle_id is not None:
             query = query.where(CollectedData.cycle_id != exclude_cycle_id)
         rows = (await db.execute(query)).scalars().all()

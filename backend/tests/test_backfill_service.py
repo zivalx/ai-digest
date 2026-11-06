@@ -7,7 +7,7 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy import delete, select
 
-from src.models import Cycle, ExtractedMention, SourceConfig, TrackRecordProcessed
+from src.models import CollectedData, Cycle, ExtractedMention, SourceConfig, TrackRecordProcessed
 from src.models.cycle import CycleStatus
 from src.services.backfill_service import BackfillService, estimate_cost
 from src.services.extraction_service import EXTRACTION_VERSION
@@ -394,3 +394,98 @@ async def test_since_filters_by_publish_time(session_factory):
     report = await _run(svc, since=date.today() - timedelta(days=60), dry_run=True)
     assert [i["id"] for i in report.items] == ["AAA", "BBB"]
     assert report.unavailable == [{"id": "NOTS", "title": "No time", "reason": "no publish time"}]
+
+
+# ---------------------------------------------------------------- persistence
+async def _collected(session_factory):
+    async with session_factory() as db:
+        rows = (await db.execute(select(CollectedData))).scalars().all()
+        cycles = (await db.execute(select(Cycle))).scalars().all()
+        return rows, cycles
+
+
+@pytest.mark.asyncio
+async def test_real_run_stores_collected_data(session_factory):
+    await _config(session_factory)
+    svc, *_ = _svc(session_factory)
+    await _run(svc)
+    rows, cycles = await _collected(session_factory)
+    assert len(rows) == 1 and rows[0].item_count == 2
+    assert [i["video_id"] for i in rows[0].data] == ["AAA", "BBB"]
+    assert rows[0].data[0]["transcript"] == "a" * 400
+    assert len(cycles) == 1 and cycles[0].name == "backfill:Fin YT"
+    assert cycles[0].status == CycleStatus.COMPLETED and rows[0].cycle_id == cycles[0].id
+
+
+@pytest.mark.asyncio
+async def test_dry_run_stores_collected_data_without_side_effects(session_factory):
+    await _config(session_factory)
+    svc, _, ext, trender = _svc(session_factory)
+    await _run(svc, dry_run=True)
+    rows, cycles = await _collected(session_factory)
+    assert len(rows) == 1 and rows[0].item_count == 2
+    assert cycles[0].status == CycleStatus.COMPLETED
+    assert ext.received == [] and trender.pushed_calls == [] and await _ledger(session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_declined_run_stores_collected_data(session_factory):
+    await _config(session_factory)
+    svc, _, ext, trender = _svc(session_factory)
+    await _run(svc, confirm=lambda m: False)
+    rows, cycles = await _collected(session_factory)
+    assert len(rows) == 1 and cycles[0].status == CycleStatus.COMPLETED
+    assert ext.received == [] and trender.pushed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_collect_failure_marks_cycle_failed(session_factory):
+    await _config(session_factory)
+    svc, orch, *_ = _svc(session_factory)
+
+    async def boom(**kw):
+        raise RuntimeError("yt down")
+    orch.collect = boom
+    with pytest.raises(RuntimeError):
+        await _run(svc)
+    rows, cycles = await _collected(session_factory)
+    assert rows == [] and cycles[0].status == CycleStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_reuse_collected_skips_orchestrator(session_factory):
+    await _config(session_factory)
+    svc1, *_ = _svc(session_factory)
+    await _run(svc1, dry_run=True)
+
+    svc2, orch2, ext2, _ = _svc(session_factory, data=[])  # orchestrator would return nothing
+    report = await svc2.run("Fin YT", date.today() - timedelta(days=100), 50, False,
+                            lambda m: True, reuse_collected=True)
+    assert orch2.specs == []
+    assert report.items_found == 2 and report.calls_pushed >= 1
+    assert sorted(e["video_id"] for e in ext2.received) == ["AAA", "BBB"]
+    rows, _ = await _collected(session_factory)
+    assert len(rows) == 1  # reuse does not store a duplicate row
+
+
+@pytest.mark.asyncio
+async def test_reuse_collected_without_stored_data_errors(session_factory):
+    await _config(session_factory)
+    svc, orch, *_ = _svc(session_factory)
+    with pytest.raises(ValueError, match="No stored collected data"):
+        await svc.run("Fin YT", date.today() - timedelta(days=100), 50, False,
+                      lambda m: True, reuse_collected=True)
+    assert orch.specs == []
+    _, cycles = await _collected(session_factory)
+    assert cycles[0].status == CycleStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_backfill_rows_do_not_count_as_seen_for_feeder(session_factory):
+    from src.services.scheduler_service import SchedulerService
+    await _config(session_factory)
+    svc, *_ = _svc(session_factory)
+    await _run(svc, dry_run=True)
+    feeder = svc._feeder
+    async with session_factory() as db:
+        assert await feeder._seen_ids(db, "youtube") == set()
