@@ -40,6 +40,25 @@ _ACTIONS = {"buy", "add", "hold", "trim", "sell", "short", "avoid", "watch"}
 _HORIZONS = {"short", "medium", "long"}
 _CALL_SOURCES = {"youtube", "telegram", "twitter"}
 
+# Stop the whole batch after this many LLM failures in a row: something
+# systemic (outage, quota, bad config) is wrong, retrying every item is waste.
+MAX_CONSECUTIVE_FAILURES = 3
+
+
+def is_fatal_llm_error(exc: Exception) -> bool:
+    """True for errors that will fail every item: bad/missing key, no access, no credit."""
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(s in text for s in (
+        "authenticationerror", "permissiondeniederror", "invalid x-api-key",
+        "invalid api key", "credit balance is too low",
+        # Claude Code CLI (LLM_PROVIDERS=claude_code)
+        "not logged in", "please run /login", "usage limit", "limit reached",
+    ))
+
+
 # Default quality-first provider order for the extraction fallback chain.
 DEFAULT_LLM_PROVIDERS = "anthropic,xai,deepseek"
 
@@ -186,6 +205,7 @@ class ExtractionService:
         self.temperature = temperature
         self.llm_providers = llm_providers or os.getenv("LLM_PROVIDERS", DEFAULT_LLM_PROVIDERS)
         self._structured_llm = structured_llm
+        self.aborted_reason: Optional[str] = None
 
     @property
     def structured_llm(self):
@@ -196,8 +216,10 @@ class ExtractionService:
 
     def _parse_providers(self) -> List[str]:
         """Parse and validate the ordered provider list from ``self.llm_providers``."""
-        from src.services.llm_factory import SUPPORTED_PROVIDERS
+        from src.services.claude_code_llm import PROVIDER as CLAUDE_CODE
+        from src.services.llm_factory import SUPPORTED_PROVIDERS as API_PROVIDERS
 
+        SUPPORTED_PROVIDERS = API_PROVIDERS + (CLAUDE_CODE,)
         providers = [p.strip().lower() for p in self.llm_providers.split(",") if p.strip()]
         if not providers:
             raise ValueError(
@@ -219,9 +241,15 @@ class ExtractionService:
         # Only the anthropic leg respects an explicit `model=` override passed
         # to the service constructor; other providers use their own env-based
         # defaults (XAI_MODEL / DEEPSEEK_MODEL) via the factory.
-        model_override = self.model if provider == "anthropic" else None
-        llm = build_chat_model(provider, model=model_override, temperature=self.temperature)
-        structured = llm.with_structured_output(PickList, method=STRUCTURED_OUTPUT_METHOD)
+        from src.services.claude_code_llm import PROVIDER as CLAUDE_CODE, ClaudeCodeStructured
+
+        if provider == CLAUDE_CODE:
+            # Local `claude -p` on the signed-in Claude Code account; no API key.
+            structured = ClaudeCodeStructured(PickList)
+        else:
+            model_override = self.model if provider == "anthropic" else None
+            llm = build_chat_model(provider, model=model_override, temperature=self.temperature)
+            structured = llm.with_structured_output(PickList, method=STRUCTURED_OUTPUT_METHOD)
 
         async def _invoke(messages):
             result = await structured.ainvoke(messages)
@@ -240,7 +268,25 @@ class ExtractionService:
         runnable is wrapped so a successful call logs which provider served
         the result -- ``with_fallbacks`` itself doesn't expose that.
         """
+        from src.services.claude_code_llm import PROVIDER as CLAUDE_CODE, claude_code_available
+        from src.services.llm_factory import _API_KEY_ENV
+
+        def usable(p: str) -> bool:
+            return claude_code_available() if p == CLAUDE_CODE else bool(os.getenv(_API_KEY_ENV[p]))
+
         providers = self._parse_providers()
+        # A provider without an API key (or, for claude_code, without the CLI)
+        # is skipped, so a missing optional key never blocks the primary one.
+        configured = [p for p in providers if usable(p)]
+        skipped = [p for p in providers if p not in configured]
+        if skipped:
+            logger.warning("Extraction providers skipped (no API key / CLI): %s", skipped)
+        if not configured:
+            raise ValueError(
+                "No extraction provider has an API key set; checked "
+                + ", ".join(_API_KEY_ENV.get(p, "claude CLI") for p in providers)
+            )
+        providers = configured
         runnables = [self._build_provider_runnable(p) for p in providers]
         primary, *fallbacks = runnables
         logger.info("Extraction fallback chain built: %s", providers)
@@ -264,15 +310,20 @@ class ExtractionService:
             - youtube metadata: ``video_id``, ``url``, ``channel``, ``title``
             - telegram metadata: ``message_link``, ``channel``, ``ts``
 
-        ``on_error(item, exc)`` is called for each item whose LLM call fails
-        (the batch still continues).
+        ``on_error(item, exc)`` is called for each item whose LLM call fails.
+        One failure does not stop the batch, but a fatal error (bad API key,
+        no access, no credit) or ``MAX_CONSECUTIVE_FAILURES`` failures in a row
+        stop it at once: the remaining items are reported through ``on_error``
+        without being sent, and ``self.aborted_reason`` says why.
 
         Returns a list of mention dicts matching the frozen output contract.
         """
         mentions: List[Dict[str, Any]] = []
         dropped = 0
+        consecutive_failures = 0
+        self.aborted_reason = None
 
-        for item in items:
+        for index, item in enumerate(items):
             transcript_text = self._build_transcript(item)
             if not transcript_text:
                 logger.info(
@@ -288,7 +339,19 @@ class ExtractionService:
                 logger.error("Extraction failed for item %s: %s", item.get("video_id"), e)
                 if on_error is not None:
                     on_error(item, e)
+                consecutive_failures += 1
+                if is_fatal_llm_error(e) or consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    self.aborted_reason = (
+                        f"stopped after {consecutive_failures} failed LLM call(s): {e}"
+                    )
+                    logger.error("Extraction aborted, %d item(s) not sent: %s",
+                                 len(items) - index - 1, self.aborted_reason)
+                    if on_error is not None:
+                        for rest in items[index + 1:]:
+                            on_error(rest, e)
+                    break
                 continue
+            consecutive_failures = 0
 
             for raw in result.picks:
                 mention = self._to_mention(raw, item)

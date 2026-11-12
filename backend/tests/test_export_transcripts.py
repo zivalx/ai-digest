@@ -72,3 +72,18 @@ async def test_export_idempotent_dedupe_latest_wins_and_filter(session_factory, 
     assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == first
     et.export(rows, tmp_path, "telegram")
     assert (tmp_path / "tg/2026-03/2026-03-01_7.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_export_skips_failed_items_and_keeps_telegram_link(session_factory, tmp_path):
+    await _store(session_factory, ITEMS[:1])
+    await _store(session_factory, [{"video_id": "AAA", "status": "failed", "error": "blocked"},
+                                   {"video_id": "DDD", "status": "failed", "error": "blocked"}])
+    await _store(session_factory, [{"message_id": 9, "channel": "tg", "text": "msg",
+                                    "message_link": "https://t.me/tg/9",
+                                    "date": "2026-03-01T00:00:00Z"}], source_type="telegram")
+    assert et.export(await et.load_rows(session_factory), tmp_path) == 2
+    assert not (tmp_path / "unknown").exists()
+    assert json.loads((tmp_path / "fin-guy/2026-01/2026-01-15_AAA.json").read_text())["transcript"] == "hello"
+    rows = list(csv.DictReader(open(tmp_path / "tg" / "index.csv", encoding="utf-8")))
+    assert rows[0]["url"] == "https://t.me/tg/9"

@@ -276,7 +276,8 @@ class CollectionOrchestrator:
         # Build client config
         api_id = os.getenv(f"{credential_ref}_API_ID")
         api_hash = os.getenv(f"{credential_ref}_API_HASH")
-        phone = os.getenv(f"{credential_ref}_PHONE")
+        # Older .env files use *_PHONE_NUMBER; accept both spellings.
+        phone = os.getenv(f"{credential_ref}_PHONE") or os.getenv(f"{credential_ref}_PHONE_NUMBER")
 
         if not all([api_id, api_hash, phone]):
             raise CollectionError(f"Missing Telegram credentials for {credential_ref}")
@@ -303,6 +304,7 @@ class CollectionOrchestrator:
             api_id=int(api_id),
             api_hash=api_hash,
             phone=phone,
+            session_name=os.getenv(f"{credential_ref}_SESSION", "connector_session"),
             auth_code_callback=get_code,
             auth_password_callback=get_password,
         )

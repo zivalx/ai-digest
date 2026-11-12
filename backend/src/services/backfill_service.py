@@ -54,6 +54,7 @@ class BackfillReport:
     dry_run: bool
     mentions_failed: int = 0
     calls_failed: int = 0  # transport / HTTP failures
+    aborted_reason: Optional[str] = None  # extraction stopped early (e.g. bad API key)
     calls_accepted: int = 0
     calls_duplicate: int = 0
     calls_rejected: Dict[str, int] = field(default_factory=dict)  # reason -> count
@@ -120,6 +121,7 @@ class BackfillService:
         concurrency: Optional[int] = None,
         delay: Optional[float] = None,
         cookies_file: Optional[str] = None,
+        no_whisper: bool = False,
     ) -> BackfillReport:
         async with self.session_factory() as db:
             config = (await db.execute(
@@ -145,6 +147,10 @@ class BackfillService:
                     spec["delay_seconds"] = delay
                 if cookies_file:
                     spec["cookies_file"] = cookies_file
+                if no_whisper:
+                    # Captions only: videos without captions fail fast and are
+                    # retried next run instead of slow local transcription.
+                    spec["whisper_model"] = ""
             cycle = Cycle(
                 name=backfill_cycle_name(source_config_name),
                 status=CycleStatus.COLLECTING,
@@ -271,6 +277,7 @@ class BackfillService:
                         failed_ids.add(SchedulerService._item_id(raw, source_type))
 
                 mentions = await self.extraction_service.extract(ext_items, on_error=on_error)
+                report.aborted_reason = getattr(self.extraction_service, "aborted_reason", None)
                 stored = await self._feeder._store_mentions(db, cycle.id, mentions)
                 await self._feeder._push(db, stored)
                 report.mentions_failed = sum(1 for row, _ in stored if not row.pushed_to_trender)

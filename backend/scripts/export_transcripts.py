@@ -51,6 +51,8 @@ def collect_items(rows: List[CollectedData]) -> Dict[tuple, Dict[str, Any]]:
         if not isinstance(row.data, list):
             continue
         for it in row.data:
+            if it.get("status") == "failed":  # collection failed: no transcript to keep
+                continue
             item_id = SchedulerService._item_id(it, row.source_type)
             if item_id is not None:
                 out[(row.source_type, item_id)] = it
@@ -65,7 +67,7 @@ def build_record(item: Dict[str, Any], source_type: str, item_id: str) -> Dict[s
         "source_type": source_type,
         "channel": _channel(item),
         "title": item.get("title"),
-        "url": item.get("url") or item.get("webpage_url"),
+        "url": item.get("url") or item.get("webpage_url") or item.get("message_link"),
         "published_at": ts,
         "ts_precision": precision,
     }

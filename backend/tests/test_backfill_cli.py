@@ -44,6 +44,7 @@ async def test_main_passes_overrides_to_service(monkeypatch):
     monkeypatch.setattr(cli, "ExtractionService", lambda: None)
     monkeypatch.setattr(cli, "TrenderClient", lambda: None)
     args = cli.parse_args(["--source-config", "X", "--dry-run", "--concurrency", "2",
-                           "--delay", "1", "--cookies", "/c.txt"])
+                           "--delay", "1", "--cookies", "/c.txt", "--no-whisper"])
     await cli.main(args)
     assert (seen["concurrency"], seen["delay"], seen["cookies_file"]) == (2, 1.0, "/c.txt")
+    assert seen["no_whisper"] is True

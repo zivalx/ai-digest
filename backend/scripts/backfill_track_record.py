@@ -46,6 +46,8 @@ def parse_args(argv=None):
                         "(overrides collect_spec; default 6)")
     p.add_argument("--cookies", metavar="FILE", default=None,
                    help="Netscape cookies.txt for YouTube (overrides collect_spec cookies_file)")
+    p.add_argument("--no-whisper", action="store_true",
+                   help="YouTube: captions only, no local Whisper fallback (missing ones retry next run)")
     p.add_argument("--repush", action="store_true",
                    help="only re-send stored calls trender has not accepted (no collection, no LLM)")
     args = p.parse_args(argv)
@@ -94,6 +96,7 @@ async def main(args) -> None:
         args.source_config, args.since, args.limit, args.dry_run, confirm,
         reuse_collected=args.from_collected,
         concurrency=args.concurrency, delay=args.delay, cookies_file=args.cookies,
+        no_whisper=args.no_whisper,
     )
     for it in report.items:
         print(f"  {it['id']}  {it['published'] or '-'}  {it['transcript_chars']} chars  {it['title'] or ''}")
@@ -105,6 +108,9 @@ async def main(args) -> None:
         f"{report.items_new} new items, ~{report.est_input_tokens} input tokens, "
         f"~${report.est_cost_usd:.2f} (lower bound: transcript tokens only)"
     )
+    if report.aborted_reason:
+        print(f"STOPPED: analysis {report.aborted_reason}. "
+              "Nothing else was sent; unprocessed items are retried on the next run.")
     if report.mentions_failed:
         print(
             f"WARNING: {report.mentions_failed} mention(s) failed to push to trender; "

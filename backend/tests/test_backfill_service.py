@@ -523,6 +523,10 @@ async def test_collect_spec_throttle_values_beat_defaults_and_overrides_beat_spe
                   concurrency=3, delay=0.5, cookies_file="/c.txt")
     s = orch.specs[1][0]
     assert (s["max_concurrency"], s["delay_seconds"], s["cookies_file"]) == (3, 0.5, "/c.txt")
+    assert "whisper_model" not in s
+    await svc.run("Fin YT", date.today() - timedelta(days=100), 50, True, lambda m: True,
+                  no_whisper=True)
+    assert orch.specs[2][0]["whisper_model"] == ""
 
 
 @pytest.mark.asyncio

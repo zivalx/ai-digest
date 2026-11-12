@@ -196,6 +196,25 @@ def test_fallback_chain_single_provider_has_no_fallbacks(monkeypatch):
     assert list(chain.fallbacks) == []
 
 
+def test_fallback_chain_skips_provider_without_api_key(monkeypatch):
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    svc = ExtractionService(llm_providers="anthropic,xai,deepseek")
+
+    chain = svc.structured_llm
+
+    assert chain.runnable.name == "extraction_provider_anthropic"
+    assert [f.name for f in chain.fallbacks] == ["extraction_provider_deepseek"]
+
+
+def test_fallback_chain_raises_when_no_provider_has_a_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    svc = ExtractionService(llm_providers="anthropic,xai")
+
+    with pytest.raises(ValueError, match="No extraction provider has an API key set"):
+        _ = svc.structured_llm
+
+
 def test_fallback_chain_invalid_provider_raises_immediately():
     svc = ExtractionService(llm_providers="anthropic,not-a-real-provider")
 
@@ -445,3 +464,60 @@ async def test_to_call_payload_matches_trender_callin_contract(origin):
         assert p["origin"] in CALLIN_ORIGINS
         assert 0 <= p["conviction"] <= 1
         assert p["citation"].get("channel")
+
+
+class _ScriptedLLM:
+    """Raises the scripted exceptions in order; returns an empty PickList for None."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    async def ainvoke(self, messages):
+        self.calls += 1
+        outcome = self.outcomes.pop(0) if self.outcomes else None
+        if outcome is not None:
+            raise outcome
+        return PickList(picks=[])
+
+
+class _AuthError(Exception):
+    status_code = 401
+
+
+def _items(n):
+    return [{"source": "youtube", "video_id": f"V{i}", "transcript": "talk"} for i in range(n)]
+
+
+@pytest.mark.asyncio
+async def test_bad_api_key_stops_batch_after_first_call():
+    llm = _ScriptedLLM([_AuthError("invalid x-api-key")] * 10)
+    svc = ExtractionService(structured_llm=llm)
+    failed = []
+
+    await svc.extract(_items(10), on_error=lambda it, e: failed.append(it["video_id"]))
+
+    assert llm.calls == 1  # no more calls once the key is known bad
+    assert failed == [f"V{i}" for i in range(10)]  # all reported, so all retried later
+    assert "invalid x-api-key" in svc.aborted_reason
+
+
+@pytest.mark.asyncio
+async def test_three_failures_in_a_row_stop_batch_but_isolated_ones_do_not():
+    boom = RuntimeError("overloaded")
+    llm = _ScriptedLLM([boom, None, boom, boom, boom, None, None])
+    svc = ExtractionService(structured_llm=llm)
+    failed = []
+
+    await svc.extract(_items(7), on_error=lambda it, e: failed.append(it["video_id"]))
+
+    assert llm.calls == 5  # V0 fails, V1 ok (resets), V2-V4 fail -> stop
+    assert failed == ["V0", "V2", "V3", "V4", "V5", "V6"]
+    assert svc.aborted_reason.startswith("stopped after 3 failed LLM call(s)")
+
+
+@pytest.mark.asyncio
+async def test_successful_batch_has_no_abort_reason():
+    svc = ExtractionService(structured_llm=_ScriptedLLM([]))
+    await svc.extract(_items(2))
+    assert svc.aborted_reason is None
