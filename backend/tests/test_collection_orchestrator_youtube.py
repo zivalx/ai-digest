@@ -39,7 +39,8 @@ def _install(monkeypatch, new_fields: bool):
 async def test_passes_present_keys_only(monkeypatch):
     cap = _install(monkeypatch, new_fields=True)
     await CollectionOrchestrator()._collect_youtube("YT", {"channels": ["@a"]})
-    assert not {"max_concurrency", "delay_seconds", "cookies_file"} & cap["cfg"].keys()
+    assert not {"max_concurrency", "delay_seconds", "cookies_file",
+                "whisper_backend", "mlx_whisper_model"} & cap["cfg"].keys()
     assert "skip_video_ids" not in cap["spec"]
 
 
@@ -49,9 +50,11 @@ async def test_passes_throttle_and_skip_ids(monkeypatch):
     await CollectionOrchestrator()._collect_youtube("YT", {
         "channels": ["@a"], "max_concurrency": 1, "delay_seconds": 6,
         "cookies_file": "/c.txt", "skip_video_ids": ["A", "B"],
+        "whisper_backend": "mlx", "mlx_whisper_model": "m/turbo",
     })
     assert (cap["cfg"]["max_concurrency"], cap["cfg"]["delay_seconds"],
             cap["cfg"]["cookies_file"]) == (1, 6, "/c.txt")
+    assert (cap["cfg"]["whisper_backend"], cap["cfg"]["mlx_whisper_model"]) == ("mlx", "m/turbo")
     assert cap["spec"]["skip_video_ids"] == ["A", "B"]
 
 

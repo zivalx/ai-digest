@@ -204,7 +204,8 @@ class CollectionOrchestrator:
         )
         throttle_kwargs = {
             k: collect_spec[k]
-            for k in ("max_concurrency", "delay_seconds", "cookies_file")
+            for k in ("max_concurrency", "delay_seconds", "cookies_file",
+                      "whisper_backend", "mlx_whisper_model")
             if collect_spec.get(k) is not None
         }
         try:
