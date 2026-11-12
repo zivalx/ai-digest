@@ -51,10 +51,12 @@ async def test_passes_throttle_and_skip_ids(monkeypatch):
         "channels": ["@a"], "max_concurrency": 1, "delay_seconds": 6,
         "cookies_file": "/c.txt", "skip_video_ids": ["A", "B"],
         "whisper_backend": "mlx", "mlx_whisper_model": "m/turbo",
+        "transcript_cache_dir": "/tc",
     })
     assert (cap["cfg"]["max_concurrency"], cap["cfg"]["delay_seconds"],
             cap["cfg"]["cookies_file"]) == (1, 6, "/c.txt")
-    assert (cap["cfg"]["whisper_backend"], cap["cfg"]["mlx_whisper_model"]) == ("mlx", "m/turbo")
+    assert (cap["cfg"]["whisper_backend"], cap["cfg"]["mlx_whisper_model"],
+            cap["cfg"]["transcript_cache_dir"]) == ("mlx", "m/turbo", "/tc")
     assert cap["spec"]["skip_video_ids"] == ["A", "B"]
 
 
