@@ -35,15 +35,21 @@ def _text(it: Dict[str, Any]) -> str:
 
 
 def status_rows(rows: List[Any], source_type: str) -> List[Dict[str, Any]]:
-    """rows: (CollectedData, cycle started_at) newest first. Newest attempt per item wins."""
+    """rows: (CollectedData, cycle started_at) newest first. Newest attempt per item wins,
+    but a stored success beats any later failure."""
     out: Dict[str, Dict[str, Any]] = {}
     for data, started_at in rows:
         for it in data.data if isinstance(data.data, list) else []:
             item_id = SchedulerService._item_id(it, source_type)
-            if item_id is None or item_id in out:
+            if item_id is None:
                 continue
             text = _text(it)
             failed = it.get("status") == "failed"
+            seen = out.get(item_id)
+            # Newest attempt wins, except that a success is never hidden by a later
+            # failure (backfills reuse the stored success).
+            if seen is not None and (failed or seen["status"] != "failed"):
+                continue
             out[item_id] = {
                 "item_id": item_id,
                 "url": it.get("url") or it.get("webpage_url") or it.get("message_link") or "",
