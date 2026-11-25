@@ -321,3 +321,26 @@ def test_telegram_item_ids_are_per_channel():
     a = SchedulerService._item_id({"message_id": 5, "channel": "@a"}, "telegram")
     b = SchedulerService._item_id({"message_id": 5, "channel": "@b"}, "telegram")
     assert a != b
+
+
+@pytest.mark.asyncio
+async def test_failed_cycle_is_recorded_as_failed_not_left_running(session_factory):
+    """A collector error must end the cycle as FAILED (it used to raise from the handler)."""
+    from src.models import Cycle
+
+    cfg = await _config(session_factory)
+
+    class Broken:
+        async def collect(self, **kw):
+            raise RuntimeError("collector blew up")
+
+    svc = SchedulerService(session_factory=session_factory, orchestrator=Broken(),
+                           extraction_service=FakeExtraction(), trender_client=RecordingTrender())
+    with pytest.raises(RuntimeError, match="collector blew up"):
+        await svc.run_finance_cycle(cfg)
+
+    async with session_factory() as db:
+        cycle = (await db.execute(select(Cycle))).scalars().one()
+    assert cycle.status == CycleStatus.FAILED
+    assert "collector blew up" in cycle.error_message
+    assert cycle.completed_at is not None

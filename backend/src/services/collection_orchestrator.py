@@ -194,9 +194,14 @@ class CollectionOrchestrator:
         """Collect from YouTube using connectors library."""
         from connectors.youtube import YouTubeCollector, YouTubeClientConfig, YouTubeCollectSpec
 
+        # Whisper (local speech-to-text fallback when a video has no captions) loads a model
+        # into RAM on every collection. YOUTUBE_WHISPER_MODEL sets the default for the whole
+        # deployment ("" = off, captions only); a source's own collect_spec still wins.
+        whisper_default = os.getenv("YOUTUBE_WHISPER_MODEL", "base")
+
         # Build client config
         config = YouTubeClientConfig(
-            whisper_model=collect_spec.get("whisper_model", "base"),
+            whisper_model=collect_spec.get("whisper_model", whisper_default),
             use_transcript_api=collect_spec.get("use_transcript_api", True),
             transcript_languages=collect_spec.get("transcript_languages", ["en"]),
             max_video_length=collect_spec.get("max_video_length", 3600),

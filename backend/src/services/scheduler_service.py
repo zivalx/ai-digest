@@ -189,11 +189,7 @@ class SchedulerService:
         """
         days = timeframe_days or self.timeframe_days
         collect_spec = {**(source_config.collect_spec or {}), **(spec_overrides or {})}
-        stats: Dict[str, int] = {
-            "collected": 0, "collector_failed": 0, "out_of_window": 0, "already_seen": 0,
-            "new": 0, "extraction_failed": 0, "mentions_found": 0, "mentions_stored": 0,
-            "pushed": 0, "accepted": 0, "rejected": 0, "push_failed": 0,
-        }
+        stats = self._new_stats()
 
         async with self.session_factory() as db:
             cycle = Cycle(
@@ -210,38 +206,17 @@ class SchedulerService:
             db.add(cycle)
             await db.commit()
             await db.refresh(cycle)
+            cycle_id = cycle.id  # read now: after a rollback the instance is expired
 
             try:
-                # 1. Collect from the source.
-                result = await self.orchestrator.collect(
-                    source_type=source_config.source_type,
-                    credential_ref=source_config.credential_ref,
-                    collect_spec=collect_spec,
-                    timeframe_days=days,
+                # 1-3. Collect, drop failed / out-of-window items, filter against the ledger.
+                result, new_items = await self._collect_new(
+                    db, source_config, collect_spec, days, cutoff, stats, exclude_cycle_id=cycle.id
                 )
-                raw_items = result.get("data", []) or []
-                stats["collected"] = len(raw_items)
                 source_type = source_config.source_type
-
-                # 2. Drop items the collector failed on, and (backfill) items outside the window.
-                usable = []
-                for it in raw_items:
-                    if isinstance(it, dict) and it.get("status") == "failed":
-                        stats["collector_failed"] += 1
-                        continue
-                    if cutoff is not None and not self._published_on_or_after(it, source_type, cutoff):
-                        stats["out_of_window"] += 1
-                        continue
-                    usable.append(it)
-
-                # 3. New-item filter against the processed-item ledger.
-                seen = await self._seen_ids(db, source_type, exclude_cycle_id=cycle.id)
-                new_items = [it for it in usable if self._item_id(it, source_type) not in seen]
-                stats["already_seen"] = len(usable) - len(new_items)
-                stats["new"] = len(new_items)
                 logger.info(
                     "Cycle %s: %d collected, %d new after filters",
-                    cycle.id, len(raw_items), len(new_items),
+                    cycle.id, stats["collected"], len(new_items),
                 )
 
                 # 4. Extract picks from new items.
@@ -285,17 +260,69 @@ class SchedulerService:
 
             except Exception as e:  # noqa: BLE001
                 await db.rollback()
-                fresh = await db.execute(select(Cycle).where(Cycle.id == cycle.id))
+                fresh = await db.execute(select(Cycle).where(Cycle.id == cycle_id))
                 cycle = fresh.scalar_one()
                 cycle.status = CycleStatus.FAILED
                 cycle.error_message = str(e)
                 cycle.completed_at = datetime.now(timezone.utc)
                 await db.commit()
-                logger.error("Cycle %s failed: %s", cycle.id, e, exc_info=True)
+                logger.error("Cycle %s failed: %s", cycle_id, e, exc_info=True)
                 raise
 
             await db.refresh(cycle)
             return cycle, stats
+
+    async def _collect_new(self, db, source_config, collect_spec, days, cutoff, stats, exclude_cycle_id=None):
+        """Collect, then keep only items worth extracting. Returns ``(result, new_items)``."""
+        source_type = source_config.source_type
+        result = await self.orchestrator.collect(
+            source_type=source_type,
+            credential_ref=source_config.credential_ref,
+            collect_spec=collect_spec,
+            timeframe_days=days,
+        )
+        raw_items = result.get("data", []) or []
+        stats["collected"] = len(raw_items)
+
+        usable = []
+        for it in raw_items:
+            if isinstance(it, dict) and it.get("status") == "failed":
+                stats["collector_failed"] += 1
+                continue
+            if cutoff is not None and not self._published_on_or_after(it, source_type, cutoff):
+                stats["out_of_window"] += 1
+                continue
+            usable.append(it)
+
+        seen = await self._seen_ids(db, source_type, exclude_cycle_id=exclude_cycle_id)
+        new_items = [it for it in usable if self._item_id(it, source_type) not in seen]
+        stats["already_seen"] = len(usable) - len(new_items)
+        stats["new"] = len(new_items)
+        return result, new_items
+
+    async def dry_run(
+        self,
+        source_config: SourceConfig,
+        *,
+        timeframe_days: Optional[int] = None,
+        spec_overrides: Optional[Dict[str, Any]] = None,
+        cutoff: Optional[datetime] = None,
+    ) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+        """Collect and filter exactly like a cycle, but extract and push nothing, write nothing."""
+        days = timeframe_days or self.timeframe_days
+        collect_spec = {**(source_config.collect_spec or {}), **(spec_overrides or {})}
+        stats = self._new_stats()
+        async with self.session_factory() as db:
+            _, new_items = await self._collect_new(db, source_config, collect_spec, days, cutoff, stats)
+        return stats, new_items
+
+    @staticmethod
+    def _new_stats() -> Dict[str, int]:
+        return {
+            "collected": 0, "collector_failed": 0, "out_of_window": 0, "already_seen": 0,
+            "new": 0, "extraction_failed": 0, "mentions_found": 0, "mentions_stored": 0,
+            "pushed": 0, "accepted": 0, "rejected": 0, "push_failed": 0,
+        }
 
     # ------------------------------------------------------------------ #
     # Ledger + mapping helpers
