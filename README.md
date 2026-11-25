@@ -311,6 +311,42 @@ WHERE created_at >= NOW() - INTERVAL '30 days'
 GROUP BY llm_provider, model_name;
 ```
 
+## Deployment (Hetzner, behind the zivalx edge)
+
+ai-digest is the third app on the shared box, after Navigator and trender. TLS, basic auth,
+backups and the watchdog belong to the `zivalx-ops` repo (`runbooks/first-deploy.md`,
+`runbooks/round-2026-11.md`); this repo only ships the app.
+
+- `docker-compose.prod.yml`: `ai-digest-db` (Postgres 16) and `ai-digest-app` (FastAPI, the
+  feeder scheduler, and the built UI at `/`). No published ports; the app joins the external
+  `edge` network, so the edge reaches it as `ai-digest-app:8001` and it reaches trender as
+  `http://trender-app:8000`. The UI is `https://digest.zivalx.com` (Sources page).
+- `.env.example`: every setting, with comments. On the server it becomes `/opt/ai-digest/.env`
+  (0600). `TRENDER_INGEST_TOKEN` must equal trender's.
+- `deploy.sh` (run on the server from `/opt/ai-digest`): pull, pre-deploy dump, build, wait for
+  `/health/deep`. The build needs the collectors library checked out at `/opt/collectors`
+  (it copies the source into `backend/collectors_src` and removes it afterwards).
+- `GET /health/deep`: `{"status": "ok|degraded|down", "checks": {...}}` for the watchdog. It
+  checks the database and the age of the last finished feeder cycle (limit 2 x interval + 30 min).
+- The container runs `alembic upgrade head` on every start, then uvicorn with one worker (the
+  feeder lives in that process).
+
+### Catch-up backfill
+
+The feeder looks at the newest few items of each source every 6 hours. After a gap, run once:
+
+```
+docker exec ai-digest-app python -m src.backfill --days 30 --dry-run   # what would be processed
+docker exec ai-digest-app python -m src.backfill --days 30             # do it
+docker exec ai-digest-app python -m src.backfill --days 30 --source "Finance YT" --max-items 80
+```
+
+Capped at 60 days and 200 items per channel. It reuses the feeder's ledger, so reruns skip what
+is done and nothing is pushed twice. The YouTube collector takes the newest N videos per channel
+and does not itself stop at a date, so the real reach is N videos per channel (default 40), then
+filtered to the window. LLM calls cost money: dry-run first. See the docstring in
+`backend/src/backfill.py`.
+
 ## Development
 
 ### Code Quality

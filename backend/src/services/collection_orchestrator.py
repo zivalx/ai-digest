@@ -264,10 +264,16 @@ class CollectionOrchestrator:
         async def get_password():
             return os.getenv(f"{credential_ref}_PASSWORD", "")
 
+        # The login session is a file. TELEGRAM_SESSION_PATH puts it on a persistent volume
+        # (the library default is a file in the working directory, lost when the container
+        # is recreated). Telethon adds the ".session" suffix itself.
+        session_name = os.getenv("TELEGRAM_SESSION_PATH") or "connector_session"
+
         config = TelegramClientConfig(
-            api_id=int(api_id),
+            api_id=str(api_id),  # the collectors model types it as str (Telethon converts it)
             api_hash=api_hash,
             phone=phone,
+            session_name=session_name,
             auth_code_callback=get_code,
             auth_password_callback=get_password,
         )
