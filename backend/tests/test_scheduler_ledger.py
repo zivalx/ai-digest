@@ -344,3 +344,35 @@ async def test_failed_cycle_is_recorded_as_failed_not_left_running(session_facto
     assert cycle.status == CycleStatus.FAILED
     assert "collector blew up" in cycle.error_message
     assert cycle.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_auth_error_stops_the_loop_instead_of_splitting(session_factory):
+    """A 401 (token mismatch) is a config problem: one request, no per-mention hammering."""
+    cfg = await _config(session_factory)
+    calls = []
+
+    class Unauthorized:
+        async def push_mentions(self, mentions):
+            calls.append(len(mentions))
+            raise TrenderPushError("trender returned 401: nope", status_code=401)
+
+    data = [_video(f"V{i}") for i in range(5)]
+    await _svc(session_factory, data, trender=Unauthorized()).run_finance_cycle(cfg)
+    assert calls == [5]
+    assert all(not r.pushed_to_trender for r in await _rows(session_factory))
+
+    # ...and once the token is right the whole backlog goes out.
+    trender = RecordingTrender()
+    await _svc(session_factory, [], trender=trender).run_finance_cycle(cfg)
+    assert sum(len(b) for b in trender.batches) == 5
+
+
+@pytest.mark.asyncio
+async def test_mentions_trender_refused_as_invalid_are_not_retried(session_factory):
+    cfg = await _config(session_factory)
+    await _svc(session_factory, [_video("POISON")], trender=PoisonTrender("POISON")).run_finance_cycle(cfg)
+
+    trender = PoisonTrender("POISON")
+    await _svc(session_factory, [], trender=trender).run_finance_cycle(cfg)
+    assert trender.batches == []

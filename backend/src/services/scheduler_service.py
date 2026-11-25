@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from ..config import get_settings
 from ..database import AsyncSessionLocal
@@ -35,6 +35,19 @@ PUSH_BATCH_SIZE = 50
 # Mentions whose push failed are retried on later cycles, but only this long.
 BACKLOG_MAX_AGE_DAYS = 14
 BACKLOG_MAX_ROWS = 500
+# trender answers these when one mention in the batch is invalid: split the batch so the
+# good ones still go through. Any other error (401 wrong token, 503 not configured, 5xx,
+# no connection) is not about the content, so the loop stops and tries again next cycle.
+SPLITTABLE_HTTP_STATUS = (400, 413, 422)
+
+
+def not_permanently_refused():
+    """SQL filter: rows trender did not refuse as invalid (those are not retried or counted)."""
+    refused = or_(*[
+        ExtractedMention.trender_response.like(f"error: trender returned {code}%")
+        for code in SPLITTABLE_HTTP_STATUS
+    ])
+    return or_(ExtractedMention.trender_response.is_(None), ~refused)
 # Dropped from the stored ledger copy of an item: the ledger only needs ids, and a
 # year of transcripts would be loaded into memory on every cycle.
 _LEDGER_HEAVY_FIELDS = ("transcript", "transcript_segments", "description")
@@ -255,6 +268,8 @@ class SchedulerService:
 
                 cycle.status = CycleStatus.COMPLETED
                 cycle.completed_at = datetime.now(timezone.utc)
+                # Kept for /health/deep (e.g. "every new item failed extraction").
+                cycle.config_snapshot = {**(cycle.config_snapshot or {}), "stats": dict(stats)}
                 await db.commit()
                 logger.info("Cycle %s completed: %d mention(s) stored", cycle.id, len(stored))
 
@@ -477,11 +492,12 @@ class SchedulerService:
                 row.trender_response = f"error: {e}"
             await db.commit()
             status = getattr(e, "status_code", None)
-            if isinstance(e, TrenderPushError) and status is not None and len(chunk) > 1:
+            if status not in SPLITTABLE_HTTP_STATUS:
+                return False
+            if len(chunk) > 1:
                 for single in chunk:
                     await self._push_chunk(db, [single], stats)
-                return True
-            return status is not None  # transport failure (no status): stop
+            return True
 
         response_text = str(response)
         for row, _ in chunk:
@@ -508,6 +524,7 @@ class SchedulerService:
         rows = (await db.execute(
             select(ExtractedMention)
             .where(ExtractedMention.pushed_to_trender == False)  # noqa: E712
+            .where(not_permanently_refused())
             .order_by(ExtractedMention.created_at)
             .limit(BACKLOG_MAX_ROWS)
         )).scalars().all()
