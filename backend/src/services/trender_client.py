@@ -17,7 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 class TrenderPushError(Exception):
-    """Raised when the mentions batch cannot be pushed after retries."""
+    """Raised when the mentions batch cannot be pushed after retries.
+
+    ``status_code`` is set when trender answered with an HTTP error and is None when it
+    could not be reached at all.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class TrenderClient:
@@ -91,7 +99,8 @@ class TrenderClient:
                     e.response.text[:500],
                 )
                 raise TrenderPushError(
-                    f"trender returned {e.response.status_code}: {e.response.text[:500]}"
+                    f"trender returned {e.response.status_code}: {e.response.text[:500]}",
+                    status_code=e.response.status_code,
                 ) from e
 
         raise TrenderPushError(f"Failed to push mentions after retries: {last_error}")

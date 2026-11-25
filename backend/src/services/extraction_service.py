@@ -208,8 +208,11 @@ class ExtractionService:
         """
         mentions: List[Dict[str, Any]] = []
         dropped = 0
+        # Positions in ``items`` whose LLM call failed. The caller keeps those items out of
+        # its processed-item ledger so the next run tries them again.
+        self.last_failed_indexes: List[int] = []
 
-        for item in items:
+        for index, item in enumerate(items):
             transcript_text = self._build_transcript(item)
             if not transcript_text:
                 logger.info(
@@ -223,6 +226,7 @@ class ExtractionService:
                 result = await self._invoke(item, transcript_text)
             except Exception as e:  # noqa: BLE001 - one item must not kill the batch
                 logger.error("Extraction failed for item %s: %s", item.get("video_id"), e)
+                self.last_failed_indexes.append(index)
                 continue
 
             for raw in result.picks:

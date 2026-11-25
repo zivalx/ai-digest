@@ -264,3 +264,27 @@ async def test_fallback_chain_falls_through_on_primary_error(monkeypatch, caplog
 
     assert result is picks
     assert any("Extraction served by provider=xai" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_failed_llm_call_is_reported_by_position():
+    """The scheduler keeps failed items out of its ledger so the next run retries them."""
+
+    class FlakyLLM:
+        def __init__(self):
+            self.n = 0
+
+        async def ainvoke(self, messages):
+            self.n += 1
+            if self.n == 2:
+                raise RuntimeError("rate limited")
+            return PickList(picks=[])
+
+    svc = ExtractionService(structured_llm=FlakyLLM())
+    items = [{"source": "youtube", "video_id": f"V{i}", "transcript": "text"} for i in range(3)]
+    assert await svc.extract(items) == []
+    assert svc.last_failed_indexes == [1]
+
+    # A second run starts from a clean slate.
+    assert await svc.extract([]) == []
+    assert svc.last_failed_indexes == []
