@@ -33,6 +33,10 @@ class ExtractedMention(Base):
     sentiment_score = Column(Numeric(4, 3), nullable=True)  # -1.000 .. 1.000
     confidence = Column(Numeric(4, 3), nullable=True)  # 0.000 .. 1.000
 
+    # When the source content was published (the payload's mentioned_at). Kept so a
+    # push that failed can be retried later with the right date.
+    mentioned_at = Column(DateTime(timezone=True), nullable=True)
+
     # Source pointer (full citation payload sent to trender)
     citation_json = Column(JSON, nullable=False)
 
