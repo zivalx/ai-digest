@@ -331,6 +331,20 @@ backups and the watchdog belong to the `zivalx-ops` repo (`runbooks/first-deploy
 - The container runs `alembic upgrade head` on every start, then uvicorn with one worker (the
   feeder lives in that process).
 
+### Telegram sources
+
+A headless server cannot enter Telegram's login code. Log in once on a Mac (the library writes
+`connector_session.session` in the working directory), then on the server:
+
+```
+docker cp connector_session.session ai-digest-app:/data/telegram.session
+docker exec -u root ai-digest-app chown digest:digest /data/telegram.session
+```
+
+`/data` is the `ai-digest_data` volume (the app reads `TELEGRAM_SESSION_PATH=/data/telegram`). The
+session file is a login credential: it is not in the git repo or the image, and the nightly
+backup does not cover this volume (log in again if it is lost).
+
 ### Catch-up backfill
 
 The feeder looks at the newest few items of each source every 6 hours. After a gap, run once:
