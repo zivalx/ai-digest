@@ -1,6 +1,8 @@
 """
 TrenderClient tests against a mocked httpx transport (no real network).
 """
+import json
+
 import httpx
 import pytest
 
@@ -95,3 +97,73 @@ async def test_empty_batch_short_circuits():
     client = _client_with(handler)
     resp = await client.push_mentions([])
     assert resp == {"pushed": 0, "response": None}
+
+
+CALLS = [{"symbol": "NVDA", "action": "buy", "origin": "feeder"}]
+
+
+@pytest.mark.asyncio
+async def test_push_calls_url_and_payload():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        captured["auth"] = request.headers.get("Authorization")
+        return httpx.Response(200, json={"accepted": 1, "duplicates": 0, "rejected": []})
+
+    client = _client_with(handler, ingest_token="tok")
+    resp = await client.push_calls(CALLS)
+
+    assert resp == {"accepted": 1, "duplicates": 0, "rejected": []}
+    assert captured["url"] == "http://trender.test/api/track-record/calls"
+    assert captured["body"] == {"calls": CALLS}
+    assert captured["auth"] == "Bearer tok"
+
+
+@pytest.mark.asyncio
+async def test_push_calls_retry_then_success():
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise httpx.ConnectError("boom", request=request)
+        return httpx.Response(200, json={"accepted": 1, "duplicates": 0, "rejected": []})
+
+    client = _client_with(handler, ingest_token=None, max_retries=2)
+    resp = await client.push_calls(CALLS)
+
+    assert resp["accepted"] == 1
+    assert attempts["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_push_retries_5xx_then_succeeds():
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return httpx.Response(503, text="unavailable")
+        return httpx.Response(200, json={"accepted": 1, "duplicates": 0, "rejected": []})
+
+    client = _client_with(handler, ingest_token=None, max_retries=2)
+    resp = await client.push_calls(CALLS)
+
+    assert resp["accepted"] == 1
+    assert attempts["n"] == 3  # 2x 503 + 1 success
+
+
+@pytest.mark.asyncio
+async def test_push_raises_after_persistent_5xx():
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(500, text="boom")
+
+    client = _client_with(handler, ingest_token=None, max_retries=1)
+    with pytest.raises(TrenderPushError, match="500"):
+        await client.push_calls(CALLS)
+    assert attempts["n"] == 2

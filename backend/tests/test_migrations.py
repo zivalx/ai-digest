@@ -97,3 +97,61 @@ def test_env_py_does_not_disable_other_loggers():
 
     logger = logging.getLogger("src.services.scheduler_service")
     assert not logger.disabled
+
+
+# --- track record (chained after d41b7a90c2f1) -----------------------------------------
+TR_MENTION_COLUMNS = {
+    "is_recommendation", "action", "horizon", "entry_price", "target_price", "stop_price",
+    "trigger_price", "quote", "said_at", "said_at_precision", "pushed_calls_to_trender",
+    "trender_calls_response", "call_payload_json",
+}
+
+
+def test_single_head_and_track_record_chain():
+    script = ScriptDirectory.from_config(_config())
+    assert script.get_heads() == ["f7b9d1e3a5c7"]
+    assert script.get_revision("d4f6b8c0e2a4").down_revision == "d41b7a90c2f1"
+    chain = [r.revision for r in script.walk_revisions("base", "heads")]
+    assert chain == ["f7b9d1e3a5c7", "e5a7c9d1f3b5", "d4f6b8c0e2a4", "d41b7a90c2f1", "c8e07325e3a6"]
+
+
+def test_fresh_database_has_track_record_schema(tmp_path, monkeypatch):
+    db_file = tmp_path / "fresh_tr.db"
+    _upgrade(monkeypatch, db_file)  # the baseline's create_all already includes them
+    engine, insp = _inspect(db_file)
+    try:
+        assert TR_MENTION_COLUMNS <= {c["name"] for c in insp.get_columns("extracted_mentions")}
+        assert "track_record" in {c["name"] for c in insp.get_columns("source_configs")}
+        assert "track_record_processed" in insp.get_table_names()
+    finally:
+        engine.dispose()
+
+
+def test_deployed_database_at_d41b_gains_track_record_schema(tmp_path, monkeypatch):
+    """The Hetzner database: built before the track record, stamped d41b7a90c2f1."""
+    from src.models import Base
+
+    db_file = tmp_path / "deployed.db"
+    engine = sa.create_engine(f"sqlite:///{db_file}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for col in sorted(TR_MENTION_COLUMNS):
+            conn.execute(sa.text(f"alter table extracted_mentions drop column {col}"))
+        conn.execute(sa.text("alter table source_configs drop column track_record"))
+        conn.execute(sa.text("drop table track_record_processed"))
+        conn.execute(sa.text("create table alembic_version (version_num varchar(32) primary key)"))
+        conn.execute(sa.text("insert into alembic_version values ('d41b7a90c2f1')"))
+    engine.dispose()
+
+    _upgrade(monkeypatch, db_file)
+    _upgrade(monkeypatch, db_file)  # idempotent
+
+    engine, insp = _inspect(db_file)
+    try:
+        assert TR_MENTION_COLUMNS <= {c["name"] for c in insp.get_columns("extracted_mentions")}
+        assert "track_record" in {c["name"] for c in insp.get_columns("source_configs")}
+        assert "track_record_processed" in insp.get_table_names()
+        with engine.connect() as conn:
+            assert conn.execute(sa.text("select version_num from alembic_version")).scalar_one() == _head()
+    finally:
+        engine.dispose()

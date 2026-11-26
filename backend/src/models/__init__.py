@@ -7,6 +7,7 @@ from .collected_data import CollectedData
 from .summary import Summary
 from .source_config import SourceConfig
 from .extracted_mention import ExtractedMention
+from .track_record_processed import TrackRecordProcessed
 
 __all__ = [
     "Base",
@@ -15,4 +16,5 @@ __all__ = [
     "Summary",
     "SourceConfig",
     "ExtractedMention",
+    "TrackRecordProcessed",
 ]

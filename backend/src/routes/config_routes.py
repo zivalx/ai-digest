@@ -36,6 +36,7 @@ async def create_config(
         collect_spec=config_data.collect_spec,
         enabled=config_data.enabled,
         purpose=config_data.purpose,
+        track_record=config_data.track_record,
     )
 
     db.add(config)
@@ -115,6 +116,8 @@ async def update_config(
         config.enabled = config_data.enabled
     if config_data.purpose is not None:
         config.purpose = config_data.purpose
+    if config_data.track_record is not None:
+        config.track_record = config_data.track_record
 
     await db.commit()
     await db.refresh(config)

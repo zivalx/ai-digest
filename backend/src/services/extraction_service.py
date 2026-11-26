@@ -21,7 +21,7 @@ consumer-side in trender.
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,35 @@ logger = logging.getLogger(__name__)
 MIN_CONFIDENCE = 0.3
 
 _STANCES = {"bullish", "bearish", "neutral"}
+
+# Track-record (recommendation) extraction contract version, sent with each call.
+EXTRACTION_VERSION = "tr-1"
+# trender CallIn.conviction default, sent when the model gave no confidence (null would 422).
+CALL_DEFAULT_CONVICTION = 0.5
+
+# Must match trender's CallIn enums; an invalid value would 422 the whole batch.
+_ACTIONS = {"buy", "add", "hold", "trim", "sell", "short", "avoid", "watch"}
+_HORIZONS = {"short", "medium", "long"}
+_CALL_SOURCES = {"youtube", "telegram", "twitter"}
+
+# Stop the whole batch after this many LLM failures in a row: something
+# systemic (outage, quota, bad config) is wrong, retrying every item is waste.
+MAX_CONSECUTIVE_FAILURES = 3
+
+
+def is_fatal_llm_error(exc: Exception) -> bool:
+    """True for errors that will fail every item: bad/missing key, no access, no credit."""
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(s in text for s in (
+        "authenticationerror", "permissiondeniederror", "invalid x-api-key",
+        "invalid api key", "credit balance is too low",
+        # Claude Code CLI (LLM_PROVIDERS=claude_code)
+        "not logged in", "please run /login", "usage limit", "limit reached",
+    ))
+
 
 # Default quality-first provider order for the extraction fallback chain.
 DEFAULT_LLM_PROVIDERS = "anthropic,xai,deepseek"
@@ -68,6 +97,32 @@ class RawPick(BaseModel):
         "discussed. Null if unknown or not a video.",
     )
     quote: str = Field(description="The exact sentence/quote supporting the pick.")
+    is_recommendation: bool = Field(
+        default=False,
+        description="True only if the author makes an actionable call (see action). "
+        "False for a mere mention/discussion. If unsure, false.",
+    )
+    action: Optional[str] = Field(
+        default=None,
+        description="One of: buy, add, hold, trim, sell, short, avoid, watch. "
+        "Null unless is_recommendation is true.",
+    )
+    horizon: Optional[str] = Field(
+        default=None,
+        description="One of: short, medium, long -- only if the author states or "
+        "clearly implies one, else null.",
+    )
+    entry_price: Optional[float] = Field(
+        default=None, description="Entry/buy price the author STATED, else null.")
+    target_price: Optional[float] = Field(
+        default=None, description="Price target the author STATED, else null.")
+    stop_price: Optional[float] = Field(
+        default=None, description="Stop-loss price the author STATED, else null.")
+    trigger_price: Optional[float] = Field(
+        default=None,
+        description="For action=watch: the level that triggers the call "
+        "(e.g. breakout above X), else null.",
+    )
 
 
 class PickList(BaseModel):
@@ -90,7 +145,29 @@ SYSTEM_PROMPT = (
     "- Each transcript line may be prefixed with a [Ns] time marker. Set "
     "start_seconds to the marker nearest where the pick is discussed.\n"
     "- quote must be a verbatim snippet from the text.\n"
-    "- If there are no genuine picks, return an empty list."
+    "- If there are no genuine picks, return an empty list.\n\n"
+    "Recommendations vs mentions:\n"
+    "- Set is_recommendation=true ONLY when the author makes an actionable call on "
+    "the ticker: says they buy/bought/hold/sell/sold it, or recommends doing so, or "
+    "gives a conditional trade plan. Merely discussing a stock (its earnings, why it "
+    "moved today, a chart description, news) is a mention: is_recommendation=false "
+    "and action=null.\n"
+    "- If unsure, is_recommendation=false.\n"
+    "- action meanings: buy = recommends buying or says they bought (opens a long); "
+    "add = adding to an existing position; hold = still holding / still likes it; "
+    "trim = partially selling; sell = exits or recommends selling; short = "
+    "recommends shorting / expects a drop; avoid = explicitly says stay away; "
+    "watch = conditional call, e.g. \"if it breaks above X it's a buy\" "
+    "(common in technical analysis; put X in trigger_price).\n"
+    "- Hebrew examples: \"אני קונה\" / \"נכנסתי לפוזיציה\" = buy; \"מוכר\" / "
+    "\"יצאתי\" = sell; \"אם תפרוץ מעל X\" = watch (trigger_price=X). A sentence "
+    "like \"מניית אנבידיה עלתה היום ב-5%\" (the stock rose 5% today) is only a "
+    "mention.\n"
+    "- horizon (short, medium or long) only if stated or clearly implied, else null.\n"
+    "- entry_price, target_price, stop_price, trigger_price: ONLY prices the author "
+    "explicitly states; never estimate or infer them. Otherwise null.\n"
+    "- Return one pick per symbol per item: the author's most decisive statement "
+    "about it. The quote must be that statement."
 )
 
 
@@ -130,6 +207,7 @@ class ExtractionService:
         self.temperature = temperature
         self.llm_providers = llm_providers or os.getenv("LLM_PROVIDERS", DEFAULT_LLM_PROVIDERS)
         self._structured_llm = structured_llm
+        self.aborted_reason: Optional[str] = None
 
     @property
     def structured_llm(self):
@@ -140,8 +218,10 @@ class ExtractionService:
 
     def _parse_providers(self) -> List[str]:
         """Parse and validate the ordered provider list from ``self.llm_providers``."""
-        from src.services.llm_factory import SUPPORTED_PROVIDERS
+        from src.services.claude_code_llm import PROVIDER as CLAUDE_CODE
+        from src.services.llm_factory import SUPPORTED_PROVIDERS as API_PROVIDERS
 
+        SUPPORTED_PROVIDERS = API_PROVIDERS + (CLAUDE_CODE,)
         providers = [p.strip().lower() for p in self.llm_providers.split(",") if p.strip()]
         if not providers:
             raise ValueError(
@@ -163,9 +243,15 @@ class ExtractionService:
         # Only the anthropic leg respects an explicit `model=` override passed
         # to the service constructor; other providers use their own env-based
         # defaults (XAI_MODEL / DEEPSEEK_MODEL) via the factory.
-        model_override = self.model if provider == "anthropic" else None
-        llm = build_chat_model(provider, model=model_override, temperature=self.temperature)
-        structured = llm.with_structured_output(PickList, method=STRUCTURED_OUTPUT_METHOD)
+        from src.services.claude_code_llm import PROVIDER as CLAUDE_CODE, ClaudeCodeStructured
+
+        if provider == CLAUDE_CODE:
+            # Local `claude -p` on the signed-in Claude Code account; no API key.
+            structured = ClaudeCodeStructured(PickList)
+        else:
+            model_override = self.model if provider == "anthropic" else None
+            llm = build_chat_model(provider, model=model_override, temperature=self.temperature)
+            structured = llm.with_structured_output(PickList, method=STRUCTURED_OUTPUT_METHOD)
 
         async def _invoke(messages):
             result = await structured.ainvoke(messages)
@@ -184,7 +270,25 @@ class ExtractionService:
         runnable is wrapped so a successful call logs which provider served
         the result -- ``with_fallbacks`` itself doesn't expose that.
         """
+        from src.services.claude_code_llm import PROVIDER as CLAUDE_CODE, claude_code_available
+        from src.services.llm_factory import _API_KEY_ENV
+
+        def usable(p: str) -> bool:
+            return claude_code_available() if p == CLAUDE_CODE else bool(os.getenv(_API_KEY_ENV[p]))
+
         providers = self._parse_providers()
+        # A provider without an API key (or, for claude_code, without the CLI)
+        # is skipped, so a missing optional key never blocks the primary one.
+        configured = [p for p in providers if usable(p)]
+        skipped = [p for p in providers if p not in configured]
+        if skipped:
+            logger.warning("Extraction providers skipped (no API key / CLI): %s", skipped)
+        if not configured:
+            raise ValueError(
+                "No extraction provider has an API key set; checked "
+                + ", ".join(_API_KEY_ENV.get(p, "claude CLI") for p in providers)
+            )
+        providers = configured
         runnables = [self._build_provider_runnable(p) for p in providers]
         primary, *fallbacks = runnables
         logger.info("Extraction fallback chain built: %s", providers)
@@ -193,7 +297,11 @@ class ExtractionService:
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
-    async def extract(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def extract(
+        self,
+        items: List[Dict[str, Any]],
+        on_error: Optional[Callable[[Dict[str, Any], Exception], None]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Extract picks from a list of collected items.
 
@@ -204,12 +312,21 @@ class ExtractionService:
             - youtube metadata: ``video_id``, ``url``, ``channel``, ``title``
             - telegram metadata: ``message_link``, ``channel``, ``ts``
 
+        ``on_error(item, exc)`` is called for each item whose LLM call fails.
+        One failure does not stop the batch, but a fatal error (bad API key,
+        no access, no credit) or ``MAX_CONSECUTIVE_FAILURES`` failures in a row
+        stop it at once: the remaining items are reported through ``on_error``
+        without being sent, and ``self.aborted_reason`` says why.
+
         Returns a list of mention dicts matching the frozen output contract.
         """
         mentions: List[Dict[str, Any]] = []
         dropped = 0
-        # Positions in ``items`` whose LLM call failed. The caller keeps those items out of
-        # its processed-item ledger so the next run tries them again.
+        consecutive_failures = 0
+        self.aborted_reason = None
+        # Positions in ``items`` whose LLM call failed (or that were never tried because the
+        # batch was aborted). The caller keeps those items out of its processed-item ledger
+        # so the next run tries them again.
         self.last_failed_indexes: List[int] = []
 
         for index, item in enumerate(items):
@@ -227,7 +344,22 @@ class ExtractionService:
             except Exception as e:  # noqa: BLE001 - one item must not kill the batch
                 logger.error("Extraction failed for item %s: %s", item.get("video_id"), e)
                 self.last_failed_indexes.append(index)
+                if on_error is not None:
+                    on_error(item, e)
+                consecutive_failures += 1
+                if is_fatal_llm_error(e) or consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    self.aborted_reason = (
+                        f"stopped after {consecutive_failures} failed LLM call(s): {e}"
+                    )
+                    logger.error("Extraction aborted, %d item(s) not sent: %s",
+                                 len(items) - index - 1, self.aborted_reason)
+                    self.last_failed_indexes.extend(range(index + 1, len(items)))
+                    if on_error is not None:
+                        for rest in items[index + 1:]:
+                            on_error(rest, e)
+                    break
                 continue
+            consecutive_failures = 0
 
             for raw in result.picks:
                 mention = self._to_mention(raw, item)
@@ -313,6 +445,19 @@ class ExtractionService:
             logger.debug("Dropping pick %s: could not build citation", symbol)
             return None
 
+        action = (raw.action or "").strip().lower() or None
+        if action not in _ACTIONS:
+            # Invalid/missing action: keep the pick for discovery, but never as a call.
+            action = None
+        horizon = (raw.horizon or "").strip().lower() or None
+        if horizon not in _HORIZONS:
+            # Invalid horizon drops only the horizon; trender defaults it from the
+            # influencer's style.
+            horizon = None
+        is_recommendation = bool(raw.is_recommendation) and action is not None
+        if not is_recommendation:
+            action = None
+
         context = raw.thesis or ""
         if raw.quote:
             context = f"{context}\n\nQuote: {raw.quote}".strip()
@@ -327,6 +472,68 @@ class ExtractionService:
             "context": context,
             "citation": citation,
             "mentioned_at": self._mentioned_at(item),
+            "is_recommendation": is_recommendation,
+            "action": action,
+            "horizon": horizon,
+            "entry_price": raw.entry_price,
+            "target_price": raw.target_price,
+            "stop_price": raw.stop_price,
+            "trigger_price": raw.trigger_price,
+            "thesis": raw.thesis,
+            "quote": raw.quote,
+            # No now() fallback: a call without a real timestamp can't be scored.
+            "said_at": item.get("ts") or None,
+            "said_at_precision": item.get("ts_precision") or None,
+        }
+
+    @staticmethod
+    def to_call_payload(
+        mention: Dict[str, Any], origin: str, extractor_model: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build trender's track-record ``CallIn`` dict from a mention, or None if the
+        mention is not a scoreable call (not a recommendation, or missing
+        action / said_at / source_item_id / citation.channel / valid source).
+        """
+        if not mention.get("is_recommendation") or not mention.get("action"):
+            return None
+        said_at = mention.get("said_at")
+        if not said_at:
+            return None
+        source = mention.get("source")
+        if source not in _CALL_SOURCES:
+            return None
+        citation = mention.get("citation") or {}
+        source_item_id = (
+            citation.get("video_id") if source == "youtube" else citation.get("message_link")
+        )
+        if not source_item_id or not citation.get("channel"):
+            return None
+        return {
+            "symbol": mention["symbol"],
+            "company_name": mention.get("company_name"),
+            "source": source,
+            "action": mention["action"],
+            "stance": mention.get("stance"),
+            "horizon": mention.get("horizon"),
+            # pure rename; trender's CallIn needs a float in [0, 1] (its default is 0.5)
+            "conviction": (
+                CALL_DEFAULT_CONVICTION if mention.get("confidence") is None
+                else float(mention["confidence"])
+            ),
+            "entry_price": mention.get("entry_price"),
+            "target_price": mention.get("target_price"),
+            "stop_price": mention.get("stop_price"),
+            "trigger_price": mention.get("trigger_price"),
+            "thesis": mention.get("thesis"),
+            "quote": mention.get("quote"),
+            "citation": citation,
+            "source_item_id": source_item_id,
+            "said_at": said_at,
+            "said_at_precision": mention.get("said_at_precision") or "datetime",
+            "origin": origin,
+            "extractor_model": extractor_model,
+            "extraction_version": EXTRACTION_VERSION,
         }
 
     @staticmethod

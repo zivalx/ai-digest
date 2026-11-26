@@ -15,6 +15,7 @@ class SourceConfigCreate(BaseModel):
     collect_spec: Dict[str, Any] = Field(..., description="Collection specification")
     enabled: bool = Field(True, description="Whether this config is enabled")
     purpose: str = Field("general", description="Feed purpose: 'general' or 'finance' (finance feeds run the trender channel-intel pipeline)")
+    track_record: bool = Field(False, description="Also push this feed's recommendations to trender's influencer track record")
 
 
 class SourceConfigUpdate(BaseModel):
@@ -24,6 +25,7 @@ class SourceConfigUpdate(BaseModel):
     collect_spec: Optional[Dict[str, Any]] = None
     enabled: Optional[bool] = None
     purpose: Optional[str] = None
+    track_record: Optional[bool] = None
 
 
 class SourceConfigResponse(BaseModel):
@@ -35,6 +37,7 @@ class SourceConfigResponse(BaseModel):
     collect_spec: Dict[str, Any]
     enabled: bool
     purpose: str
+    track_record: bool
     created_at: datetime
     updated_at: datetime
 

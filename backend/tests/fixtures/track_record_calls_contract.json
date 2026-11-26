@@ -1,0 +1,61 @@
+{
+  "calls": [
+    {
+      "symbol": "NVDA",
+      "company_name": "NVIDIA",
+      "source": "youtube",
+      "action": "buy",
+      "stance": "bullish",
+      "horizon": "short",
+      "conviction": 0.8,
+      "entry_price": 100.0,
+      "target_price": 120.0,
+      "stop_price": 95.0,
+      "trigger_price": null,
+      "thesis": "Breakout setup",
+      "quote": "I'm buying NVDA here",
+      "citation": {
+        "kind": "youtube",
+        "url": "https://youtu.be/dQw4w9WgXcQ?t=60",
+        "video_id": "dQw4w9WgXcQ",
+        "channel": "Micha Stocks",
+        "title": "NVDA breakout",
+        "start_seconds": 60,
+        "quote": "I'm buying NVDA here"
+      },
+      "source_item_id": "dQw4w9WgXcQ",
+      "said_at": "2026-10-01T12:00:00Z",
+      "said_at_precision": "datetime",
+      "origin": "feeder",
+      "extractor_model": "claude-sonnet-5",
+      "extraction_version": "tr-1"
+    },
+    {
+      "symbol": "AAPL",
+      "company_name": "Apple",
+      "source": "telegram",
+      "action": "sell",
+      "stance": "bearish",
+      "horizon": null,
+      "conviction": 0.65,
+      "entry_price": null,
+      "target_price": null,
+      "stop_price": null,
+      "trigger_price": null,
+      "thesis": "Taking profits",
+      "quote": "מוכר את AAPL",
+      "citation": {
+        "kind": "telegram",
+        "message_link": "https://t.me/noamstocks/1234",
+        "channel": "noamstocks",
+        "quote": "מוכר את AAPL"
+      },
+      "source_item_id": "https://t.me/noamstocks/1234",
+      "said_at": "2026-10-02",
+      "said_at_precision": "date",
+      "origin": "feeder",
+      "extractor_model": "claude-sonnet-5",
+      "extraction_version": "tr-1"
+    }
+  ]
+}

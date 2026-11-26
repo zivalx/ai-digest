@@ -11,9 +11,21 @@ NEW videos/messages, so LLM cost is bounded and reruns are cheap. Mentions are
 deduped by ``dedupe_key`` before insert and gated by ``pushed_to_trender`` before
 send, so retries never double-count.
 
+Track-record calls: every extracted recommendation's call payload is stored on
+its mention row (``call_payload_json``, also for rows that already existed) before
+the ledger is written, then pushed to ``/api/track-record/calls`` with the same
+rules as mentions: batches of at most ``PUSH_BATCH_SIZE``, a call is flagged pushed
+only once trender accepted it (or already had it), a batch trender refuses as
+invalid (400/413/422) is split down to single calls, any other failure (401, 503,
+5xx, no connection) stops the loop until the next cycle, and unpushed calls
+(failed, or rejected e.g. for an unmapped channel) are retried by later
+track-record cycles for ``BACKLOG_MAX_AGE_DAYS``. A single call trender refuses
+as invalid is not retried.
+
 Wiring into app startup is guarded by ``FEEDER_ENABLED`` (default false).
 """
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,13 +53,18 @@ BACKLOG_MAX_ROWS = 500
 SPLITTABLE_HTTP_STATUS = (400, 413, 422)
 
 
-def not_permanently_refused():
-    """SQL filter: rows trender did not refuse as invalid (those are not retried or counted)."""
+def not_permanently_refused(column=None):
+    """SQL filter: rows trender did not refuse as invalid (those are not retried or counted).
+
+    ``column`` is the response column to check: ``trender_response`` (mentions, default)
+    or ``trender_calls_response`` (track-record calls).
+    """
+    column = ExtractedMention.trender_response if column is None else column
     refused = or_(*[
-        ExtractedMention.trender_response.like(f"error: trender returned {code}%")
+        column.like(f"error: trender returned {code}%")
         for code in SPLITTABLE_HTTP_STATUS
     ])
-    return or_(ExtractedMention.trender_response.is_(None), ~refused)
+    return or_(column.is_(None), ~refused)
 # Dropped from the stored ledger copy of an item: the ledger only needs ids, and a
 # year of transcripts would be loaded into memory on every cycle.
 _LEDGER_HEAVY_FIELDS = ("transcript", "transcript_segments", "description")
@@ -85,6 +102,44 @@ def _parse_iso(value: Any) -> Optional[datetime]:
 def _chunks(seq: List[Any], size: int):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
+
+
+@dataclass
+class CallPushResult:
+    """Outcome of one call push, from trender's ``{accepted, duplicates, rejected}``."""
+
+    sent: int = 0
+    accepted: int = 0
+    duplicate: int = 0
+    rejected: Dict[str, int] = field(default_factory=dict)  # reason -> count
+    failed: int = 0  # transport / HTTP failures (left unpushed)
+
+    @property
+    def pushed(self) -> int:
+        return self.accepted + self.duplicate
+
+
+def _symbol_unique_batches(
+    rows: List[ExtractedMention], max_size: int = PUSH_BATCH_SIZE
+) -> List[List[ExtractedMention]]:
+    """Split rows into batches of at most ``max_size`` with no symbol repeated in one.
+
+    trender identifies rejected calls only by symbol, so this keeps the mapping
+    from a rejection back to its row exact.
+    """
+    batches: List[List[ExtractedMention]] = []
+    symbols: List[set] = []
+    for row in rows:
+        symbol = (row.call_payload_json or {}).get("symbol")
+        for batch, seen in zip(batches, symbols):
+            if symbol not in seen and len(batch) < max_size:
+                batch.append(row)
+                seen.add(symbol)
+                break
+        else:
+            batches.append([row])
+            symbols.append({symbol})
+    return batches
 
 
 class SchedulerService:
@@ -249,6 +304,11 @@ class SchedulerService:
                 # 5. Build ExtractedMention rows (dedupe before insert).
                 stored = await self._store_mentions(db, cycle.id, mentions)
                 stats["mentions_stored"] = len(stored)
+                # 5b. Track record: store each recommendation's call payload on its row
+                # (before the ledger, so a crash after it still leaves the call to push).
+                pending_calls: List[ExtractedMention] = []
+                if source_config.track_record:
+                    pending_calls = await self._attach_calls(db, mentions, origin="feeder")
 
                 # 6. Record the ledger (ids only, after the mentions are safe in the DB).
                 ledger = [_slim(it) for i, it in enumerate(new_items) if i not in failed_idx]
@@ -265,6 +325,9 @@ class SchedulerService:
 
                 # 7. Push to trender (this cycle's mentions plus any earlier failed pushes).
                 await self._push(db, stored, stats)
+                if source_config.track_record:
+                    # 8. Push calls: this cycle's plus earlier ones still unpushed (same rules).
+                    self._apply_call_stats(stats, await self._push_calls(db, pending_calls))
 
                 cycle.status = CycleStatus.COMPLETED
                 cycle.completed_at = datetime.now(timezone.utc)
@@ -344,7 +407,14 @@ class SchedulerService:
     # ------------------------------------------------------------------ #
     async def _seen_ids(self, db, source_type: str, exclude_cycle_id=None) -> set:
         """Collect all previously-seen item ids for this source from CollectedData."""
-        query = select(CollectedData).where(CollectedData.source_type == source_type)
+        # Backfill rows are archives (possibly of declined/dry runs), not proof an
+        # item was processed, so they don't count as "seen" for the feeder.
+        query = (
+            select(CollectedData)
+            .join(Cycle, Cycle.id == CollectedData.cycle_id)
+            .where(CollectedData.source_type == source_type)
+            .where(Cycle.name.notlike("backfill:%"))
+        )
         if exclude_cycle_id is not None:
             query = query.where(CollectedData.cycle_id != exclude_cycle_id)
         rows = (await db.execute(query)).scalars().all()
@@ -445,10 +515,21 @@ class SchedulerService:
                 stance=mention.get("stance"),
                 sentiment_score=mention.get("sentiment_score"),
                 confidence=mention.get("confidence"),
+                is_recommendation=bool(mention.get("is_recommendation")),
+                action=mention.get("action"),
+                horizon=mention.get("horizon"),
+                entry_price=mention.get("entry_price"),
+                target_price=mention.get("target_price"),
+                stop_price=mention.get("stop_price"),
+                trigger_price=mention.get("trigger_price"),
+                quote=mention.get("quote"),
+                said_at=mention.get("said_at"),
+                said_at_precision=mention.get("said_at_precision"),
                 citation_json=mention.get("citation", {}) or {},
                 mentioned_at=_parse_iso(mention.get("mentioned_at")),
                 dedupe_key=key,
                 pushed_to_trender=False,
+                pushed_calls_to_trender=False,
             )
             db.add(row)
             stored.append((row, mention))
@@ -558,3 +639,173 @@ class SchedulerService:
             "citation": citation,
             "mentioned_at": when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+
+    async def _attach_calls(self, db, mentions: List[Dict[str, Any]], origin: str) -> List[ExtractedMention]:
+        """
+        Store the call payload of every extracted recommendation on its mention
+        row, including rows that already existed (dedupe_key collision), and
+        return the rows whose call still needs pushing.
+
+        An existing row keeps its discovery fields and any payload it already
+        has; only a missing payload is filled in.
+        """
+        model = self.extraction_service.model
+        payloads: Dict[str, Dict[str, Any]] = {}
+        for mention in mentions:
+            call = ExtractionService.to_call_payload(mention, origin, model)
+            if call is not None:
+                payloads.setdefault(ExtractionService.dedupe_key_for(mention), call)
+        if not payloads:
+            return []
+
+        keys = list(payloads)
+        rows: Dict[str, ExtractedMention] = {}
+        for i in range(0, len(keys), 500):  # stay under DB bind-parameter limits
+            chunk = keys[i:i + 500]
+            found = await db.execute(
+                select(ExtractedMention).where(ExtractedMention.dedupe_key.in_(chunk))
+            )
+            rows.update({row.dedupe_key: row for row in found.scalars().all()})
+
+        pending = []
+        for key in keys:  # keep extraction order
+            row = rows.get(key)
+            if row is None:
+                continue
+            if row.call_payload_json is None:
+                row.call_payload_json = payloads[key]
+            if not row.pushed_calls_to_trender:
+                pending.append(row)
+        await db.commit()
+        return pending
+
+    async def repush_unpushed_calls(
+        self, db, *, max_age_days: Optional[int] = BACKLOG_MAX_AGE_DAYS
+    ) -> CallPushResult:
+        """
+        Re-send stored call payloads trender has not accepted yet (failed push, or
+        rejected e.g. for an unmapped channel). Not scoped to a source config.
+
+        Default: the cycle's window and row cap. ``max_age_days=None`` (the manual
+        ``backfill_track_record.py --repush``) takes every eligible call, any age.
+        Calls trender refused as invalid are never re-sent.
+        """
+        return await self._push_calls(db, [], max_age_days=max_age_days)
+
+    async def _unpushed_calls_backlog(
+        self, db, exclude_ids, max_age_days: Optional[int] = BACKLOG_MAX_AGE_DAYS
+    ) -> List[ExtractedMention]:
+        """Earlier calls still waiting for trender, oldest first (window and cap unless None)."""
+        query = (
+            select(ExtractedMention)
+            .where(
+                ExtractedMention.call_payload_json.is_not(None),
+                ExtractedMention.pushed_calls_to_trender == False,  # noqa: E712
+            )
+            .where(not_permanently_refused(ExtractedMention.trender_calls_response))
+            .order_by(ExtractedMention.created_at)
+        )
+        if max_age_days is not None:
+            query = query.limit(BACKLOG_MAX_ROWS)
+        rows = (await db.execute(query)).scalars().all()
+        since = (
+            None if max_age_days is None
+            else datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        )
+        out = []
+        for row in rows:
+            if row.id in exclude_ids:
+                continue
+            created = row.created_at
+            if since is not None and created is not None:
+                created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+                if created < since:
+                    continue
+            out.append(row)
+        return out
+
+    async def _push_calls(
+        self, db, rows: List[ExtractedMention], *, max_age_days: Optional[int] = BACKLOG_MAX_AGE_DAYS
+    ) -> CallPushResult:
+        """
+        Push ``rows``' stored call payloads, plus earlier unpushed calls, to trender's
+        track-record endpoint (see the module docstring for the rules).
+
+        Accepted and duplicate calls are flagged pushed; rejected calls (matched back
+        by symbol, unique per request) and failures stay unpushed with the response
+        recorded, so a later cycle retries them.
+        """
+        result = CallPushResult()
+        current = [r for r in rows if r.call_payload_json and not r.pushed_calls_to_trender]
+        backlog = await self._unpushed_calls_backlog(
+            db, exclude_ids={r.id for r in current}, max_age_days=max_age_days
+        )
+        todo = backlog + current
+        if not todo:
+            return result
+        if backlog:
+            logger.info("Retrying %d track-record call(s) that were not pushed earlier", len(backlog))
+
+        attempted: set = set()
+        for batch in _symbol_unique_batches(todo):
+            if not await self._push_call_batch(db, batch, result, attempted):
+                logger.error("trender unreachable; %d call(s) stay unpushed",
+                             sum(1 for r in todo if not r.pushed_calls_to_trender))
+                break
+
+        result.sent = len(attempted)
+        result.failed = sum(
+            1 for r in todo
+            if not r.pushed_calls_to_trender
+            and not (r.trender_calls_response or "").startswith("rejected:")
+        )
+        if result.rejected:
+            logger.warning("trender rejected track-record call(s): %s", result.rejected)
+        return result
+
+    async def _push_call_batch(self, db, batch, result: CallPushResult, attempted: set) -> bool:
+        """Push one batch of calls. Returns False when trender could not be reached at all."""
+        attempted.update(id(row) for row in batch)
+        try:
+            response = await self.trender_client.push_calls(
+                [row.call_payload_json for row in batch]
+            )
+        except Exception as e:  # noqa: BLE001 - record failure, leave flag False
+            logger.error("trender calls push failed for %d call(s): %s", len(batch), e)
+            for row in batch:
+                row.trender_calls_response = f"error: {e}"
+            await db.commit()
+            if getattr(e, "status_code", None) not in SPLITTABLE_HTTP_STATUS:
+                return False
+            if len(batch) > 1:  # one invalid call must not block the others
+                for single in batch:
+                    await self._push_call_batch(db, [single], result, attempted)
+            return True
+
+        response = response if isinstance(response, dict) else {}
+        rejected: Dict[str, str] = {}
+        for entry in response.get("rejected") or []:
+            reason = entry.get("reason") or "unknown"
+            rejected[entry.get("symbol")] = reason
+            result.rejected[reason] = result.rejected.get(reason, 0) + 1
+        duplicates = int(response.get("duplicates") or 0)
+        result.duplicate += duplicates
+        result.accepted += int(response.get("accepted", len(batch) - duplicates - len(rejected)))
+
+        text = str(response)
+        for row in batch:
+            reason = rejected.get(row.call_payload_json.get("symbol"))
+            if reason is None:
+                row.pushed_calls_to_trender = True
+                row.trender_calls_response = text
+            else:
+                row.trender_calls_response = f"rejected: {reason}; {text}"
+        await db.commit()
+        return True
+
+    @staticmethod
+    def _apply_call_stats(stats: Dict[str, int], calls: CallPushResult) -> None:
+        stats["calls_sent"] = calls.sent
+        stats["calls_pushed"] = calls.pushed
+        stats["calls_rejected"] = sum(calls.rejected.values())
+        stats["calls_push_failed"] = calls.failed
