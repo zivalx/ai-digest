@@ -180,3 +180,11 @@ def test_deploy_script_passes_the_secret_only_when_corp_ca_is_set():
     assert '--secret id=corp_ca,src="${CORP_CA}"' in branch
     assert "--secret" not in other
     assert "up -d --build" in other and "up -d --build" not in branch
+
+
+def test_sqlalchemy_asyncio_extra_is_required():
+    # SQLAlchemy 2.1 stopped installing greenlet by default; without the [asyncio] extra the async
+    # engine (alembic/env.py, the app) fails at import and the container crash-loops.
+    reqs = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text()
+    lines = [l.split("#", 1)[0].strip() for l in reqs.splitlines()]
+    assert any(l.startswith("sqlalchemy[asyncio]") for l in lines)
