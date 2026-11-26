@@ -2,9 +2,16 @@
 Daigest FastAPI Application
 Orchestrates data collection from multiple sources and generates AI summaries.
 """
+import logging
+import os
+from typing import List, Optional
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import logging
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import health  # imported at start-up: its STARTED_AT is the process start time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -16,10 +23,19 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# CORS middleware (adjust origins for production)
+def cors_origins() -> List[str]:
+    """Allowed browser origins. Only needed for the React dev server: in production the UI
+    is served by this app, so the browser talks to the same origin."""
+    raw = os.getenv("CORS_ORIGINS")
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return ["http://localhost:3000", "http://localhost:3001"]
+
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # React dev server
+    allow_origins=cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,9 +77,8 @@ async def shutdown_event():
         feeder_scheduler = None
 
 
-@app.get("/")
 async def root():
-    """Health check endpoint."""
+    """Status endpoint (only registered when no UI is being served at /)."""
     return {
         "status": "ok",
         "service": "Daigest API",
@@ -96,8 +111,37 @@ async def health_check():
     }
 
 
+@app.get("/health/deep")
+async def health_deep():
+    """Deep health for the zivalx-ops watchdog: database, feeder age, extraction, push backlog.
+
+    Looked up on the module at call time so tests can replace ``src.health.deep_health``.
+    """
+    result = await health.deep_health()
+    return JSONResponse(result, status_code=health.status_code_for(result))
+
+
 # Register API routes
 from .routes import cycle_router, config_router
 
 app.include_router(cycle_router, prefix="/api/cycles", tags=["Cycles"])
 app.include_router(config_router, prefix="/api/configs", tags=["Configurations"])
+
+
+def mount_ui(application: FastAPI, directory: Optional[str]) -> bool:
+    """Serve a built React app from ``directory`` at / (same origin as the API).
+
+    Must run after every API route is registered: the mount is a catch-all. Returns False
+    (and mounts nothing) when there is no build there.
+    """
+    if not directory or not os.path.isfile(os.path.join(directory, "index.html")):
+        return False
+    application.mount("/", StaticFiles(directory=directory, html=True), name="ui")
+    return True
+
+
+# The production image copies the frontend build to UI_DIR; local development has none.
+if mount_ui(app, os.getenv("UI_DIR")):
+    logger.info("Serving the UI from %s", os.getenv("UI_DIR"))
+else:
+    app.add_api_route("/", root, methods=["GET"])

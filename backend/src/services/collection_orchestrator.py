@@ -62,8 +62,9 @@ class CollectionOrchestrator:
         if source_type == "pytrends":
             # PyTrends uses format: "today 1-d", "today 3-d", "today 7-d"
             spec.setdefault("timeframe", f"today {timeframe_days}-d")
-        elif source_type == "youtube":
-            # YouTube uses days_back parameter
+        elif source_type in ("youtube", "telegram"):
+            # collectors honours days_back for YouTube and Telegram (feat/honor-days-back):
+            # out-of-window items are skipped before any caption or message processing.
             spec.setdefault("days_back", timeframe_days)
         elif source_type == "gnews":
             # GNews might support from/to parameters (check connector docs)
@@ -194,9 +195,14 @@ class CollectionOrchestrator:
         """Collect from YouTube using connectors library."""
         from connectors.youtube import YouTubeCollector, YouTubeClientConfig, YouTubeCollectSpec
 
+        # Whisper (local speech-to-text fallback when a video has no captions) loads a model
+        # into RAM on every collection. YOUTUBE_WHISPER_MODEL sets the default for the whole
+        # deployment ("" = off, captions only); a source's own collect_spec still wins.
+        whisper_default = os.getenv("YOUTUBE_WHISPER_MODEL", "base")
+
         # Build client config
         config = YouTubeClientConfig(
-            whisper_model=collect_spec.get("whisper_model", "base"),
+            whisper_model=collect_spec.get("whisper_model", whisper_default),
             use_transcript_api=collect_spec.get("use_transcript_api", True),
             transcript_languages=collect_spec.get("transcript_languages", ["en"]),
             max_video_length=collect_spec.get("max_video_length", 3600),
@@ -259,20 +265,30 @@ class CollectionOrchestrator:
         async def get_password():
             return os.getenv(f"{credential_ref}_PASSWORD", "")
 
+        # The login session is a file. TELEGRAM_SESSION_PATH puts it on a persistent volume
+        # (the library default is a file in the working directory, lost when the container
+        # is recreated). Telethon adds the ".session" suffix itself.
+        session_name = os.getenv("TELEGRAM_SESSION_PATH") or "connector_session"
+
         config = TelegramClientConfig(
-            api_id=int(api_id),
+            api_id=str(api_id),  # the collectors model types it as str (Telethon converts it)
             api_hash=api_hash,
             phone=phone,
+            session_name=session_name,
             auth_code_callback=get_code,
             auth_password_callback=get_password,
         )
 
         # Build collect spec
-        spec = TelegramCollectSpec(
+        spec_kwargs = dict(
             channels=collect_spec.get("channels", []),
             max_messages_per_channel=collect_spec.get("max_messages", 200),
             include_replies=collect_spec.get("include_replies", True),
         )
+        # Older collectors releases have no Telegram window; pass it only when supported.
+        if collect_spec.get("days_back") and "days_back" in getattr(TelegramCollectSpec, "model_fields", {}):
+            spec_kwargs["days_back"] = collect_spec["days_back"]
+        spec = TelegramCollectSpec(**spec_kwargs)
 
         # Collect data
         collector = TelegramCollector(config)

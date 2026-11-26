@@ -8,6 +8,10 @@ Revision ID: c8e07325e3a6
 Revises:
 Create Date: 2026-08-25 12:00:00
 
+Safe on every starting point: on an empty database it builds the whole current schema
+(there is no earlier baseline revision); on an older create_all database it only adds
+what is missing. The container runs ``alembic upgrade head`` on every start.
+
 """
 from typing import Sequence, Union
 
@@ -25,18 +29,33 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # source_configs.purpose
-    with op.batch_alter_table("source_configs") as batch_op:
-        batch_op.add_column(
-            sa.Column(
-                "purpose",
-                sa.String(length=50),
-                nullable=False,
-                server_default="general",
-            )
-        )
+    bind = op.get_bind()
+    tables = set(sa.inspect(bind).get_table_names())
 
-    # extracted_mentions
+    if "source_configs" not in tables:
+        # Brand-new database: there is no baseline revision before this one, so build
+        # the whole current schema here (this already includes everything below).
+        from src.models import Base
+
+        Base.metadata.create_all(bind)
+        return
+
+    # Existing database (tables made by create_all before the feeder existed).
+    columns = {c["name"] for c in sa.inspect(bind).get_columns("source_configs")}
+    if "purpose" not in columns:
+        with op.batch_alter_table("source_configs") as batch_op:
+            batch_op.add_column(
+                sa.Column(
+                    "purpose",
+                    sa.String(length=50),
+                    nullable=False,
+                    server_default="general",
+                )
+            )
+
+    if "extracted_mentions" in tables:
+        return
+
     op.create_table(
         "extracted_mentions",
         sa.Column("id", GUID(), nullable=False),

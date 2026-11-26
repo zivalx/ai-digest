@@ -2,6 +2,7 @@
 Alembic environment configuration for async SQLAlchemy.
 """
 import asyncio
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -20,7 +21,14 @@ config = context.config
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Keep the application's own loggers alive (the default would disable them).
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
+
+# The real database URL comes from the environment (the container sets DATABASE_URL),
+# never from the placeholder in alembic.ini.
+_database_url = os.getenv("DATABASE_URL")
+if _database_url:
+    config.set_main_option("sqlalchemy.url", _database_url.replace("%", "%%"))
 
 # add your model's MetaData object here
 # for 'autogenerate' support
