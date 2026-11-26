@@ -4,6 +4,8 @@ Revision ID: e5a7c9d1f3b5
 Revises: d4f6b8c0e2a4
 Create Date: 2026-11-02 13:00:00
 
+Idempotent: a brand-new database already has the table from the baseline's create_all.
+
 """
 from typing import Sequence, Union
 
@@ -21,6 +23,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    if "track_record_processed" in sa.inspect(op.get_bind()).get_table_names():
+        return
     op.create_table(
         "track_record_processed",
         sa.Column("id", GUID(), nullable=False),
@@ -40,4 +44,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_table("track_record_processed")
+    if "track_record_processed" in sa.inspect(op.get_bind()).get_table_names():
+        op.drop_table("track_record_processed")

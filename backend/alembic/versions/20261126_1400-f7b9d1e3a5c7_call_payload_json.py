@@ -8,6 +8,8 @@ Revision ID: f7b9d1e3a5c7
 Revises: e5a7c9d1f3b5
 Create Date: 2026-11-02 14:00:00
 
+Idempotent: a brand-new database already has the column from the baseline's create_all.
+
 """
 from typing import Sequence, Union
 
@@ -22,11 +24,18 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _has_column() -> bool:
+    columns = sa.inspect(op.get_bind()).get_columns("extracted_mentions")
+    return "call_payload_json" in {c["name"] for c in columns}
+
+
 def upgrade() -> None:
-    with op.batch_alter_table("extracted_mentions") as batch_op:
-        batch_op.add_column(sa.Column("call_payload_json", sa.JSON(), nullable=True))
+    if not _has_column():
+        with op.batch_alter_table("extracted_mentions") as batch_op:
+            batch_op.add_column(sa.Column("call_payload_json", sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("extracted_mentions") as batch_op:
-        batch_op.drop_column("call_payload_json")
+    if _has_column():
+        with op.batch_alter_table("extracted_mentions") as batch_op:
+            batch_op.drop_column("call_payload_json")
