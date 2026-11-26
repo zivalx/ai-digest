@@ -13,6 +13,9 @@
 #   COLLECTORS_SRC       path of the collectors checkout (default: auto-detected as above)
 #   DEPLOY_NO_PULL=1     do not git pull
 #   DEPLOY_PREPARE_ONLY=1  only prepare (and clean up) the build context, then stop
+#   CORP_CA              local-only, behind a TLS-inspecting proxy: path of a corporate root CA,
+#                        passed to the image build as the BuildKit secret `corp_ca` (never copied
+#                        into an image). Unset on the server = the plain build.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -97,7 +100,14 @@ else
 fi
 
 echo "==> Building and starting services (the first build downloads Node and Python packages)"
-${COMPOSE} up -d --build
+if [ -n "${CORP_CA:-}" ]; then
+    # RUN --mount (the corp_ca secret) requires BuildKit.
+    export DOCKER_BUILDKIT=1
+    docker build --secret id=corp_ca,src="${CORP_CA}" -f backend/Dockerfile -t ai-digest-digest .
+    ${COMPOSE} up -d # the image just built carries the name compose expects: no second build
+else
+    ${COMPOSE} up -d --build
+fi
 
 echo "==> Waiting for deep health..."
 for _ in $(seq 1 90); do

@@ -113,3 +113,70 @@ def test_env_template_lists_every_variable_the_code_reads():
 def test_env_template_points_at_trender_over_the_internal_network():
     assert re.search(r"^TRENDER_BASE_URL=http://trender-app:8000$",
                      (REPO / ".env.example").read_text(), re.M)
+
+
+# --- optional local-only corporate CA build secret (same pattern as Navigator and trender) ---------
+
+DOCKERFILE = REPO / "backend" / "Dockerfile"
+
+
+def _logical_lines(path):
+    """Instructions with comments dropped and backslash continuations joined."""
+    out, cur = [], ""
+    for ln in path.read_text().splitlines():
+        if ln.lstrip().startswith("#"):
+            continue
+        cur = f"{cur} {ln.strip()}" if cur else ln
+        if cur.endswith("\\"):
+            cur = cur[:-1].rstrip()
+            continue
+        out.append(cur)
+        cur = ""
+    return out
+
+
+def _download_runs():
+    return [ln for ln in _logical_lines(DOCKERFILE)
+            if ln.startswith("RUN ") and ("pip install" in ln or "npm ci" in ln)]
+
+
+def test_every_download_run_mounts_the_optional_corp_ca_secret():
+    runs = _download_runs()
+    assert len(runs) == 3, runs  # npm ci, requirements.txt, collectors
+    for ln in runs:
+        assert "--mount=type=secret,id=corp_ca,required=false" in ln
+        assert "/run/secrets/corp_ca" in ln
+
+
+def test_pip_runs_build_a_temp_bundle_from_system_roots_and_clean_up():
+    for ln in (r for r in _download_runs() if "pip install" in r):
+        assert "/etc/ssl/certs/ca-certificates.crt /run/secrets/corp_ca > /tmp/ca-bundle.pem" in ln
+        assert "trap 'rm -f /tmp/ca-bundle.pem' EXIT" in ln
+        assert "|| exit 1" in ln
+        assert "PIP_CERT=/tmp/ca-bundle.pem" in ln
+
+
+def test_npm_uses_node_extra_ca_certs_from_the_secret():
+    (npm,) = [r for r in _download_runs() if "npm ci" in r]
+    assert "NODE_EXTRA_CA_CERTS=/run/secrets/corp_ca" in npm
+
+
+def test_no_cert_copied_into_the_image_or_set_in_env():
+    for ln in _logical_lines(DOCKERFILE):
+        if re.match(r"(COPY|ADD)\b", ln):
+            assert not re.search(r"\.(pem|crt|cer)\b|corp_ca", ln), ln
+        if re.match(r"(ENV|ARG)\b", ln):
+            assert not re.search(r"corp_ca|SSL_CERT|PIP_CERT|CA_CERTS|\.pem", ln, re.I), ln
+    text = DOCKERFILE.read_text()
+    assert "update-ca-certificates" not in text
+    assert "/usr/local/share/ca-certificates" not in text
+
+
+def test_deploy_script_passes_the_secret_only_when_corp_ca_is_set():
+    text = (REPO / "deploy.sh").read_text()
+    assert text.count("--secret") == 1
+    _, rest = text.split('if [ -n "${CORP_CA:-}" ]; then', 1)
+    branch, other = rest.split("\nelse\n", 1)
+    assert '--secret id=corp_ca,src="${CORP_CA}"' in branch
+    assert "--secret" not in other
+    assert "up -d --build" in other and "up -d --build" not in branch

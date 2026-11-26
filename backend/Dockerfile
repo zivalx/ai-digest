@@ -11,7 +11,12 @@ ARG NODE_IMAGE=node:20-alpine
 FROM ${NODE_IMAGE} AS ui
 WORKDIR /ui
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+# Optional local-only build secret `corp_ca` (corporate root CA for a TLS-inspecting proxy): used
+# inside the download RUN steps only (node appends it to its roots), never copied into a layer.
+# Absent (the server) => identical to a normal build.
+RUN --mount=type=secret,id=corp_ca,required=false \
+    if [ -s /run/secrets/corp_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/corp_ca; fi; \
+    npm ci --no-audit --no-fund
 COPY frontend/public ./public
 COPY frontend/src ./src
 # Empty API URL = same origin (the page and /api are served by the same app behind the edge).
@@ -37,11 +42,25 @@ RUN useradd -m -r digest && chown digest:digest /app && mkdir /data && chown dig
 
 # Python deps first (layer cache)
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Same optional `corp_ca` secret: a bundle of the system roots + the CA exists only inside this
+# RUN and is removed by the EXIT trap; no ENV, no layer content.
+RUN --mount=type=secret,id=corp_ca,required=false \
+    if [ -s /run/secrets/corp_ca ]; then \
+      trap 'rm -f /tmp/ca-bundle.pem' EXIT; \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/corp_ca > /tmp/ca-bundle.pem \
+        && export PIP_CERT=/tmp/ca-bundle.pem SSL_CERT_FILE=/tmp/ca-bundle.pem || exit 1; \
+    fi; \
+    pip install --no-cache-dir -r requirements.txt
 
 # collectors library ("connectors" package), copied in by deploy.sh from ../collectors/collectors
 COPY backend/collectors_src/ /tmp/collectors_src/
-RUN pip install --no-cache-dir "/tmp/collectors_src[all]" && rm -rf /tmp/collectors_src
+RUN --mount=type=secret,id=corp_ca,required=false \
+    if [ -s /run/secrets/corp_ca ]; then \
+      trap 'rm -f /tmp/ca-bundle.pem' EXIT; \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/corp_ca > /tmp/ca-bundle.pem \
+        && export PIP_CERT=/tmp/ca-bundle.pem SSL_CERT_FILE=/tmp/ca-bundle.pem || exit 1; \
+    fi; \
+    pip install --no-cache-dir "/tmp/collectors_src[all]" && rm -rf /tmp/collectors_src
 
 # App source (only what runs: no tests, no collectors_src, no legacy digest_runner) and the built UI
 COPY --chown=digest:digest backend/src ./src
