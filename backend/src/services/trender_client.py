@@ -18,7 +18,15 @@ logger = logging.getLogger(__name__)
 
 
 class TrenderPushError(Exception):
-    """Raised when the mentions batch cannot be pushed after retries."""
+    """Raised when the mentions batch cannot be pushed after retries.
+
+    ``status_code`` is set when trender answered with an HTTP error and is None when it
+    could not be reached at all.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class TrenderClient:
@@ -86,6 +94,7 @@ class TrenderClient:
         url = f"{self.base_url}{path}"
 
         last_error: Optional[str] = None
+        last_status: Optional[int] = None  # HTTP status of the last 5xx; None for transport errors
         for attempt in range(self.max_retries + 1):
             try:
                 response = await self._post(url, payload)
@@ -95,12 +104,14 @@ class TrenderClient:
                 return data
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_error = str(e)
+                last_status = None
             except httpx.HTTPStatusError as e:
                 status, body = e.response.status_code, e.response.text[:500]
                 if status < 500:
                     logger.error("trender rejected the batch: %s %s", status, body)
-                    raise TrenderPushError(f"trender returned {status}: {body}") from e
+                    raise TrenderPushError(f"trender returned {status}: {body}", status_code=status) from e
                 last_error = f"trender returned {status}: {body}"
+                last_status = status
 
             if attempt < self.max_retries:
                 delay = self.backoff_base * (2 ** attempt)
@@ -115,7 +126,9 @@ class TrenderClient:
             else:
                 logger.error("Push to trender failed after %d attempts: %s", attempt + 1, last_error)
 
-        raise TrenderPushError(f"Failed to push {label} after retries: {last_error}")
+        raise TrenderPushError(
+            f"Failed to push {label} after retries: {last_error}", status_code=last_status
+        )
 
     async def _post(self, url: str, payload: Dict[str, Any]) -> httpx.Response:
         """Perform the POST, using an injected client if provided else a fresh one."""

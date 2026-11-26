@@ -45,6 +45,10 @@ class ExtractedMention(Base):
     said_at = Column(String(40), nullable=True)
     said_at_precision = Column(String(8), nullable=True)
 
+    # When the source content was published (the payload's mentioned_at). Kept so a
+    # push that failed can be retried later with the right date.
+    mentioned_at = Column(DateTime(timezone=True), nullable=True)
+
     # Source pointer (full citation payload sent to trender)
     citation_json = Column(JSON, nullable=False)
 

@@ -1,37 +1,63 @@
+# ai-digest on the shared Hetzner box (third app, after Navigator and trender).
+# Deployed by ./deploy.sh from /opt/ai-digest. TLS and basic auth live at the edge Caddy in
+# zivalx-ops (digest.zivalx.com); this app publishes no ports. Env file: .env (like trender),
+# built from .env.example, mode 0600, never committed.
+name: ai-digest # keeps volume ai-digest_pgdata
+
 services:
   db:
     image: postgres:16-alpine
+    container_name: ai-digest-db
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-digest}
+      POSTGRES_DB: ${POSTGRES_DB:-digest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-digest} -d ${POSTGRES_DB:-digest}"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
+    mem_limit: 256m
+    restart: unless-stopped # default network only, never on edge
 
-  app:
+  # Service is called `digest`, not `app`: trender's service is `app` and both sit on `edge`.
+  digest:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: ai-digest-app
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-digest}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-digest}
+      FEEDER_ENABLED: ${FEEDER_ENABLED:-true} # the point of this deployment; the code default is off
+      TELEGRAM_SESSION_PATH: /data/telegram
+    # No ports: the edge Caddy reaches ai-digest-app:8001, and this app reaches trender over the
+    # same network as http://trender-app:8000.
+    networks: [default, edge]
+    volumes:
+      - data:/data # telegram login session, if a telegram source is used
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "8001:8001"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 60s
+    mem_limit: 768m # about 300 MB idle; the backfill (docker exec) and Whisper add to it
+    cpus: 1.0 # keeps Whisper / yt-dlp from starving the other two apps
+    stop_grace_period: 30s
     restart: unless-stopped
+
+networks:
+  edge:
+    external: true
 
 volumes:
   pgdata:
+    name: ai-digest_pgdata
+  data:
+    name: ai-digest_data

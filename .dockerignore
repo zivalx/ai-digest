@@ -1,0 +1,29 @@
+# Build context is the repo root (see backend/Dockerfile). Keep secrets and junk out of it.
+.git
+.github
+.claude
+.bmad
+.agentvibes
+.mcp.json
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/node_modules
+frontend/build
+frontend/coverage
+# secrets and local state: never inside an image
+**/.env
+**/.env.*
+!**/.env.example
+**/*.session
+**/*.session-journal
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+backend/output
+backend/tests
+backend/pytest.ini
+*.md
+*.bat

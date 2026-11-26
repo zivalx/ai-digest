@@ -4,15 +4,17 @@ uvicorn>=0.24.0
 
 # Database
 asyncpg>=0.29.0
-sqlalchemy>=2.0.0
+sqlalchemy[asyncio]>=2.0.0,<3  # [asyncio] pulls greenlet; SQLAlchemy 2.1 no longer installs it by default
 alembic>=1.12.0
 aiosqlite>=0.19.0  # For SQLite async support (dev/testing)
 
 # Data validation
 pydantic>=2.4.0
 
-# Connectors library (external data collection)
-connectors[all]>=0.1.0
+# Connectors library (external data collection): NOT installed from here. A package called
+# "connectors" on PyPI is a different project. It comes from the sibling `collectors` repo:
+# the Docker build installs ../collectors/collectors (deploy.sh copies it into the build
+# context), and local development uses `pip install -e "../collectors/collectors[all]"`.
 
 # LLM dependencies
 langchain>=0.1.0

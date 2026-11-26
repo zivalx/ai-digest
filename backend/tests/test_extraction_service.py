@@ -521,3 +521,27 @@ async def test_successful_batch_has_no_abort_reason():
     svc = ExtractionService(structured_llm=_ScriptedLLM([]))
     await svc.extract(_items(2))
     assert svc.aborted_reason is None
+
+
+@pytest.mark.asyncio
+async def test_failed_llm_call_is_reported_by_position():
+    """The scheduler keeps failed items out of its ledger so the next run retries them."""
+
+    class FlakyLLM:
+        def __init__(self):
+            self.n = 0
+
+        async def ainvoke(self, messages):
+            self.n += 1
+            if self.n == 2:
+                raise RuntimeError("rate limited")
+            return PickList(picks=[])
+
+    svc = ExtractionService(structured_llm=FlakyLLM())
+    items = [{"source": "youtube", "video_id": f"V{i}", "transcript": "text"} for i in range(3)]
+    assert await svc.extract(items) == []
+    assert svc.last_failed_indexes == [1]
+
+    # A second run starts from a clean slate.
+    assert await svc.extract([]) == []
+    assert svc.last_failed_indexes == []

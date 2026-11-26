@@ -322,6 +322,10 @@ class ExtractionService:
         dropped = 0
         consecutive_failures = 0
         self.aborted_reason = None
+        # Positions in ``items`` whose LLM call failed (or that were never tried because the
+        # batch was aborted). The caller keeps those items out of its processed-item ledger
+        # so the next run tries them again.
+        self.last_failed_indexes: List[int] = []
 
         for index, item in enumerate(items):
             transcript_text = self._build_transcript(item)
@@ -337,6 +341,7 @@ class ExtractionService:
                 result = await self._invoke(item, transcript_text)
             except Exception as e:  # noqa: BLE001 - one item must not kill the batch
                 logger.error("Extraction failed for item %s: %s", item.get("video_id"), e)
+                self.last_failed_indexes.append(index)
                 if on_error is not None:
                     on_error(item, e)
                 consecutive_failures += 1
@@ -346,6 +351,7 @@ class ExtractionService:
                     )
                     logger.error("Extraction aborted, %d item(s) not sent: %s",
                                  len(items) - index - 1, self.aborted_reason)
+                    self.last_failed_indexes.extend(range(index + 1, len(items)))
                     if on_error is not None:
                         for rest in items[index + 1:]:
                             on_error(rest, e)
