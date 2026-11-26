@@ -182,3 +182,21 @@ async def test_calls_older_than_the_backlog_window_are_not_retried(session_facto
     assert trender.requests == [["V1"]]
     state = await _state(session_factory)
     assert state["V0"][0] is False and state["V1"][0] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_repush_has_no_age_window_but_skips_refused_calls(session_factory):
+    """backfill_track_record.py --repush is an operator action: every eligible call, any age."""
+    old = datetime.now(timezone.utc) - timedelta(days=BACKLOG_MAX_AGE_DAYS + 30)
+    await _rows(session_factory, ["OLD", "BAD"], created_at=old)
+    async with session_factory() as db:
+        bad = (await db.execute(select(ExtractedMention).where(ExtractedMention.symbol == "BAD"))).scalars().one()
+        bad.trender_calls_response = "error: trender returned 422: invalid"
+        await db.commit()
+
+    trender = ScriptedTrender()
+    svc = SchedulerService(session_factory=session_factory, orchestrator=None,
+                           extraction_service=None, trender_client=trender)
+    async with session_factory() as db:
+        await svc.repush_unpushed_calls(db, max_age_days=None)
+    assert trender.requests == [["V0"]]

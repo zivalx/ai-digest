@@ -679,18 +679,24 @@ class SchedulerService:
         await db.commit()
         return pending
 
-    async def repush_unpushed_calls(self, db) -> CallPushResult:
+    async def repush_unpushed_calls(
+        self, db, *, max_age_days: Optional[int] = BACKLOG_MAX_AGE_DAYS
+    ) -> CallPushResult:
         """
         Re-send stored call payloads trender has not accepted yet (failed push, or
-        rejected e.g. for an unmapped channel), with the same window and rules as a
-        cycle. Not scoped to a source config: any eligible row is retried.
-        """
-        return await self._push_calls(db, [])
+        rejected e.g. for an unmapped channel). Not scoped to a source config.
 
-    async def _unpushed_calls_backlog(self, db, exclude_ids) -> List[ExtractedMention]:
-        """Earlier calls still waiting for trender, oldest first, within the retry window."""
-        since = datetime.now(timezone.utc) - timedelta(days=BACKLOG_MAX_AGE_DAYS)
-        rows = (await db.execute(
+        Default: the cycle's window and row cap. ``max_age_days=None`` (the manual
+        ``backfill_track_record.py --repush``) takes every eligible call, any age.
+        Calls trender refused as invalid are never re-sent.
+        """
+        return await self._push_calls(db, [], max_age_days=max_age_days)
+
+    async def _unpushed_calls_backlog(
+        self, db, exclude_ids, max_age_days: Optional[int] = BACKLOG_MAX_AGE_DAYS
+    ) -> List[ExtractedMention]:
+        """Earlier calls still waiting for trender, oldest first (window and cap unless None)."""
+        query = (
             select(ExtractedMention)
             .where(
                 ExtractedMention.call_payload_json.is_not(None),
@@ -698,21 +704,29 @@ class SchedulerService:
             )
             .where(not_permanently_refused(ExtractedMention.trender_calls_response))
             .order_by(ExtractedMention.created_at)
-            .limit(BACKLOG_MAX_ROWS)
-        )).scalars().all()
+        )
+        if max_age_days is not None:
+            query = query.limit(BACKLOG_MAX_ROWS)
+        rows = (await db.execute(query)).scalars().all()
+        since = (
+            None if max_age_days is None
+            else datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        )
         out = []
         for row in rows:
             if row.id in exclude_ids:
                 continue
             created = row.created_at
-            if created is not None:
+            if since is not None and created is not None:
                 created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
                 if created < since:
                     continue
             out.append(row)
         return out
 
-    async def _push_calls(self, db, rows: List[ExtractedMention]) -> CallPushResult:
+    async def _push_calls(
+        self, db, rows: List[ExtractedMention], *, max_age_days: Optional[int] = BACKLOG_MAX_AGE_DAYS
+    ) -> CallPushResult:
         """
         Push ``rows``' stored call payloads, plus earlier unpushed calls, to trender's
         track-record endpoint (see the module docstring for the rules).
@@ -723,7 +737,9 @@ class SchedulerService:
         """
         result = CallPushResult()
         current = [r for r in rows if r.call_payload_json and not r.pushed_calls_to_trender]
-        backlog = await self._unpushed_calls_backlog(db, exclude_ids={r.id for r in current})
+        backlog = await self._unpushed_calls_backlog(
+            db, exclude_ids={r.id for r in current}, max_age_days=max_age_days
+        )
         todo = backlog + current
         if not todo:
             return result

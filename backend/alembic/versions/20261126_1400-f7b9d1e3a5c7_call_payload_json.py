@@ -1,7 +1,7 @@
 """call_payload_json on extracted_mentions
 
 Stores the exact track-record call payload so failed / rejected call pushes can
-be re-sent later (sweep at the start of each track-record cycle, or
+be re-sent later (by the next track-record cycles' push, or
 ``backfill_track_record.py --repush``) without re-running the LLM.
 
 Revision ID: f7b9d1e3a5c7

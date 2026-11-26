@@ -354,9 +354,9 @@ class BackfillService:
         return items
 
     async def repush(self) -> CallPushResult:
-        """Re-send stored, not-yet-accepted calls only: no collection, no LLM."""
+        """Re-send stored, not-yet-accepted calls only (any age): no collection, no LLM."""
         async with self.session_factory() as db:
-            return await self._feeder.repush_unpushed_calls(db)
+            return await self._feeder.repush_unpushed_calls(db, max_age_days=None)
 
     @staticmethod
     def _apply_calls(report: BackfillReport, calls: CallPushResult) -> None:
