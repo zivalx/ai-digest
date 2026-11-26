@@ -71,7 +71,8 @@ async def test_export_idempotent_dedupe_latest_wins_and_filter(session_factory, 
     et.export(rows, tmp_path, "youtube")
     assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == first
     et.export(rows, tmp_path, "telegram")
-    assert (tmp_path / "tg/2026-03/2026-03-01_7.json").exists()
+    # telegram ids are "<channel>:<message_id>" (message ids are only unique per channel)
+    assert (tmp_path / "tg/2026-03/2026-03-01_tg-7.json").exists()
 
 
 @pytest.mark.asyncio
