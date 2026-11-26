@@ -339,3 +339,32 @@ async def test_non_track_record_cycle_stores_no_payload_and_does_not_sweep(sessi
             await db.execute(select(ExtractedMention).where(ExtractedMention.dedupe_key.contains("BBB")))
         ).scalars().one()
         assert row.call_payload_json is None
+
+
+@pytest.mark.asyncio
+async def test_track_record_cycle_reports_call_stats(session_factory):
+    cfg = await _make_finance_config(session_factory, track_record=True)
+    cycle = await _svc(session_factory, FakeExtraction(), FakeTrender()).run_finance_cycle(cfg)
+    stats = cycle.config_snapshot["stats"]
+    assert (stats["calls_sent"], stats["calls_pushed"], stats["calls_rejected"], stats["calls_push_failed"]) == (
+        1, 1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_call_payload_is_stored_even_when_the_mention_push_fails(session_factory):
+    """Payloads are attached before the ledger, so a later cycle can still push the call."""
+    cfg = await _make_finance_config(session_factory, track_record=True)
+
+    class DownTrender(FakeTrender):
+        async def push_mentions(self, mentions):
+            raise RuntimeError("down")
+
+        async def push_calls(self, calls):
+            raise RuntimeError("down")
+
+    await _svc(session_factory, FakeExtraction(), DownTrender()).run_finance_cycle(cfg)
+    async with session_factory() as db:
+        row = (await db.execute(select(ExtractedMention))).scalars().one()
+        assert row.call_payload_json["source_item_id"] == "AAA"
+        assert row.pushed_calls_to_trender is False
+        assert (await db.execute(select(CollectedData))).scalars().all()  # ledger written
