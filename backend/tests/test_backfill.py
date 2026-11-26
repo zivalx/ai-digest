@@ -73,7 +73,9 @@ def test_window_starts_at_midnight_utc_n_days_back():
 def test_spec_overrides_per_source_type():
     assert backfill.spec_overrides_for("youtube", 30, 40) == {
         "days_back": 30, "max_videos_per_channel": 40}
-    assert backfill.spec_overrides_for("telegram", 30, 200) == {"max_messages": 200}
+    assert backfill.spec_overrides_for("telegram", 30, 200) == {"days_back": 30, "max_messages": 200}
+    assert backfill.spec_overrides_for("youtube", 30, None) == {
+        "days_back": 30, "max_videos_per_channel": backfill.DEFAULT_MAX_ITEMS["youtube"]}
     assert backfill.spec_overrides_for("reddit", 30, 40) == {}
 
 
@@ -263,3 +265,13 @@ async def test_report_text_and_exit_codes(session_factory):
     report.sources[0].stats["push_failed"] = 2
     assert report.exit_code() == 3
     assert "run the same command again" in backfill.format_report(report)
+
+
+def test_timeframe_sets_days_back_for_youtube_and_telegram():
+    from src.services.collection_orchestrator import CollectionOrchestrator
+    apply = CollectionOrchestrator._apply_timeframe
+    orch = CollectionOrchestrator.__new__(CollectionOrchestrator)
+    assert apply(orch, "youtube", {}, 5)["days_back"] == 5
+    assert apply(orch, "telegram", {}, 5)["days_back"] == 5
+    assert apply(orch, "telegram", {"days_back": 30}, 5)["days_back"] == 30  # explicit spec wins
+    assert "days_back" not in apply(orch, "reddit", {}, 5)

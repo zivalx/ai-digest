@@ -4,8 +4,8 @@
 #
 # Needs next to this checkout a checkout of the collectors library (the "connectors" package):
 #   /opt/ai-digest   this repo
-#   /opt/collectors  github.com/zivalx/collectors, branch with the transcript-segment and lazy
-#                    Whisper commits (feat/channel-intel-feeder at the time of writing)
+#   /opt/collectors  github.com/zivalx/collectors: main once the stack is merged, until then
+#                    feat/honor-days-back (on top of feat/youtube-published-at and PR #1)
 # The build copies its source into backend/collectors_src for the Docker build and removes it
 # afterwards. On a dev Mac the layout is ../collectors/collectors (the inner dir is the git root).
 #
