@@ -44,8 +44,10 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 
 MAX_BACKFILL_DAYS = 60
-MAX_ITEMS_CAP = 200
-DEFAULT_MAX_ITEMS = {"youtube": 40, "telegram": 200}
+# The collectors window (days_back) bounds the real work: items older than the window are skipped
+# before captions or message processing, so these are only upper bounds per channel.
+MAX_ITEMS_CAP = 500
+DEFAULT_MAX_ITEMS = {"youtube": 100, "telegram": 500}
 FALLBACK_MAX_ITEMS = 40
 # A cycle that started less than this long ago and has not finished blocks the backfill.
 BUSY_WINDOW = timedelta(hours=3)
@@ -149,7 +151,7 @@ def spec_overrides_for(source_type: str, days: int, max_items: Optional[int]) ->
         return {"days_back": days,
                 "max_videos_per_channel": max_items or DEFAULT_MAX_ITEMS["youtube"]}
     if source_type == "telegram":
-        return {"max_messages": max_items or DEFAULT_MAX_ITEMS["telegram"]}
+        return {"days_back": days, "max_messages": max_items or DEFAULT_MAX_ITEMS["telegram"]}
     return {}
 
 
