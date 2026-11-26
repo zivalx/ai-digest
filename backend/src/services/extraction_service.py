@@ -34,6 +34,8 @@ _STANCES = {"bullish", "bearish", "neutral"}
 
 # Track-record (recommendation) extraction contract version, sent with each call.
 EXTRACTION_VERSION = "tr-1"
+# trender CallIn.conviction default, sent when the model gave no confidence (null would 422).
+CALL_DEFAULT_CONVICTION = 0.5
 
 # Must match trender's CallIn enums; an invalid value would 422 the whole batch.
 _ACTIONS = {"buy", "add", "hold", "trim", "sell", "short", "avoid", "watch"}
@@ -514,7 +516,11 @@ class ExtractionService:
             "action": mention["action"],
             "stance": mention.get("stance"),
             "horizon": mention.get("horizon"),
-            "conviction": mention.get("confidence"),  # pure rename
+            # pure rename; trender's CallIn needs a float in [0, 1] (its default is 0.5)
+            "conviction": (
+                CALL_DEFAULT_CONVICTION if mention.get("confidence") is None
+                else float(mention["confidence"])
+            ),
             "entry_price": mention.get("entry_price"),
             "target_price": mention.get("target_price"),
             "stop_price": mention.get("stop_price"),
