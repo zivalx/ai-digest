@@ -200,3 +200,12 @@ async def test_manual_repush_has_no_age_window_but_skips_refused_calls(session_f
     async with session_factory() as db:
         await svc.repush_unpushed_calls(db, max_age_days=None)
     assert trender.requests == [["V0"]]
+
+
+@pytest.mark.asyncio
+async def test_batch_size_follows_trender_push_batch_size(session_factory, monkeypatch):
+    monkeypatch.setenv("TRENDER_PUSH_BATCH_SIZE", "7")
+    await _rows(session_factory, [f"S{i}" for i in range(16)])
+    trender = ScriptedTrender()
+    await _repush(session_factory, trender)
+    assert [len(r) for r in trender.requests] == [7, 7, 2]

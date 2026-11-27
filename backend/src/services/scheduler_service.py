@@ -14,7 +14,7 @@ send, so retries never double-count.
 Track-record calls: every extracted recommendation's call payload is stored on
 its mention row (``call_payload_json``, also for rows that already existed) before
 the ledger is written, then pushed to ``/api/track-record/calls`` with the same
-rules as mentions: batches of at most ``PUSH_BATCH_SIZE``, a call is flagged pushed
+rules as mentions: batches of at most ``TRENDER_PUSH_BATCH_SIZE`` (default ``PUSH_BATCH_SIZE``), a call is flagged pushed
 only once trender accepted it (or already had it), a batch trender refuses as
 invalid (400/413/422) is split down to single calls, any other failure (401, 503,
 5xx, no connection) stops the loop until the next cycle, and unpushed calls
@@ -42,7 +42,8 @@ from .trender_client import TrenderClient, TrenderPushError
 
 logger = logging.getLogger(__name__)
 
-# Mentions per request to trender (it re-scores candidates after every request).
+# Default mentions/calls per request to trender (it re-scores candidates after every
+# request). TRENDER_PUSH_BATCH_SIZE overrides it; read it with push_batch_size().
 PUSH_BATCH_SIZE = 50
 # Mentions whose push failed are retried on later cycles, but only this long.
 BACKLOG_MAX_AGE_DAYS = 14
@@ -99,6 +100,11 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def push_batch_size() -> int:
+    """Configured batch size (TRENDER_PUSH_BATCH_SIZE, default PUSH_BATCH_SIZE)."""
+    return get_settings().trender_push_batch_size
+
+
 def _chunks(seq: List[Any], size: int):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
@@ -120,13 +126,14 @@ class CallPushResult:
 
 
 def _symbol_unique_batches(
-    rows: List[ExtractedMention], max_size: int = PUSH_BATCH_SIZE
+    rows: List[ExtractedMention], max_size: Optional[int] = None
 ) -> List[List[ExtractedMention]]:
     """Split rows into batches of at most ``max_size`` with no symbol repeated in one.
 
     trender identifies rejected calls only by symbol, so this keeps the mapping
     from a rejection back to its row exact.
     """
+    max_size = max_size or push_batch_size()
     batches: List[List[ExtractedMention]] = []
     symbols: List[set] = []
     for row in rows:
@@ -556,7 +563,7 @@ class SchedulerService:
         if backlog:
             logger.info("Retrying %d mention(s) that were not pushed earlier", len(backlog))
 
-        for chunk in _chunks(pairs, PUSH_BATCH_SIZE):
+        for chunk in _chunks(pairs, push_batch_size()):
             if not await self._push_chunk(db, chunk, stats):
                 logger.error("trender unreachable; %d mention(s) stay unpushed", len(pairs))
                 break

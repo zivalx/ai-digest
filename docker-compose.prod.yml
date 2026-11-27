@@ -33,6 +33,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-digest}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-digest}
       FEEDER_ENABLED: ${FEEDER_ENABLED:-true} # the point of this deployment; the code default is off
       TELEGRAM_SESSION_PATH: /data/telegram
+      LOG_DIR: /data/logs # run logs + summaries, on the data volume (survive rebuilds)
     # No ports: the edge Caddy reaches ai-digest-app:8001, and this app reaches trender over the
     # same network as http://trender-app:8000.
     networks: [default, edge]
