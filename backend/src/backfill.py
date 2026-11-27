@@ -43,6 +43,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
 
+from .run_log import run_log
+
 MAX_BACKFILL_DAYS = 60
 # The collectors window (days_back) bounds the real work: items older than the window are skipped
 # before captions or message processing, so these are only upper bounds per channel.
@@ -293,9 +295,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
-        report = asyncio.run(run_backfill(
-            days=args.days, source=args.source, max_items=args.max_items,
-            dry_run=args.dry_run, force=args.force))
+        with run_log("backfill", args.source or "all") as run:
+            report = asyncio.run(run_backfill(
+                days=args.days, source=args.source, max_items=args.max_items,
+                dry_run=args.dry_run, force=args.force))
+            run.summary["stats"] = {
+                "dry_run": report.dry_run, "days": report.days, "totals": report.totals,
+                "sources": {s.name: {"ok": s.ok, "error": s.error, **s.stats} for s in report.sources},
+            }
+            if run.log_path:
+                print(f"run log: {run.log_path}", file=sys.stderr)
     except BackfillError as exc:
         print(f"backfill: {exc}", file=sys.stderr)
         return 1

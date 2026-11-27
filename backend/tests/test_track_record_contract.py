@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from src.services.extraction_service import ExtractionService, PickList, RawPick
+from src.services.extraction_service import EXTRACTION_VERSION, ExtractionService, PickList, RawPick
 from src.services.trender_client import TrenderClient
 
 FIXTURE = Path(__file__).parent / "fixtures" / "track_record_calls_contract.json"
@@ -72,7 +72,13 @@ async def test_feeder_builds_exactly_the_contract_payload():
         await _payload(TELEGRAM_ITEM, _pick(**TELEGRAM_PICK)),
     ]
     # Round-trip through JSON, as call_payload_json stores it and httpx sends it.
-    assert json.loads(json.dumps({"calls": built})) == expected
+    sent = json.loads(json.dumps({"calls": built}))
+    # extraction_version is a free-form label that changes with the prompt (the shape is
+    # what the contract pins), so the shared fixture keeps its original value.
+    assert {c.pop("extraction_version") for c in sent["calls"]} == {EXTRACTION_VERSION}
+    for call in sent["calls"]:
+        call["extraction_version"] = "tr-1"
+    assert sent == expected
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@ ExtractionService tests with a stubbed LLM (no real Claude call).
 """
 import pytest
 
-from src.services.extraction_service import ExtractionService, PickList, RawPick
+from src.services.extraction_service import EXTRACTION_VERSION, ExtractionService, PickList, RawPick
 
 
 @pytest.fixture(autouse=True)
@@ -399,7 +399,7 @@ async def test_to_call_payload_shape():
         "citation", "source_item_id", "said_at", "said_at_precision", "origin",
         "extractor_model", "extraction_version",
     }
-    assert p["extraction_version"] == "tr-1"
+    assert p["extraction_version"] == EXTRACTION_VERSION == "tr-2"
     assert p["conviction"] == 0.8
     assert p["source_item_id"] == "VID1"
     assert p["citation"]["channel"] == "@micha"
@@ -545,3 +545,31 @@ async def test_failed_llm_call_is_reported_by_position():
     # A second run starts from a clean slate.
     assert await svc.extract([]) == []
     assert svc.last_failed_indexes == []
+
+
+def test_prompt_and_schema_tell_the_model_to_suffix_tel_aviv_tickers():
+    """Incident 2026-11-27: Tel Aviv stocks were extracted as bare AYAL/ELAL and rejected."""
+    from src.services.extraction_service import SYSTEM_PROMPT
+
+    assert ".TA" in SYSTEM_PROMPT and "AYAL.TA" in SYSTEM_PROMPT
+    assert "TEVA.TA" in SYSTEM_PROMPT  # dual listing: use the one actually discussed
+    assert "no suffix" in SYSTEM_PROMPT.lower()
+    assert ".TA" in RawPick.model_fields["symbol"].description
+
+
+@pytest.mark.asyncio
+async def test_ta_suffixed_symbol_survives_extraction_and_reaches_the_call_payload():
+    item = {
+        "source": "telegram", "message_link": "https://t.me/ch/9", "channel": "ch",
+        "text": "קונה איילון", "ts": "2026-10-02", "ts_precision": "date",
+    }
+
+    class _LLM:
+        async def ainvoke(self, messages):
+            return PickList(picks=[RawPick(
+                symbol="ayal.ta", thesis="t", stance="bullish", sentiment_score=0.5,
+                confidence=0.8, quote="קונה איילון", is_recommendation=True, action="buy")])
+
+    (mention,) = await ExtractionService(structured_llm=_LLM()).extract([item])
+    assert mention["symbol"] == "AYAL.TA"
+    assert ExtractionService.to_call_payload(mention, "feeder", "m")["symbol"] == "AYAL.TA"

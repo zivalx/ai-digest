@@ -167,3 +167,64 @@ async def test_push_raises_after_persistent_5xx():
     with pytest.raises(TrenderPushError, match="500"):
         await client.push_calls(CALLS)
     assert attempts["n"] == 2
+
+
+# --- errors that say what happened; configurable timeout --------------------------------------
+
+@pytest.mark.asyncio
+async def test_timeout_error_names_the_exception_the_wait_the_endpoint_and_batch_size(caplog):
+    """Incident 2026-11-27: the log said 'Push to trender failed (attempt 1/3): ;' (empty)."""
+    import logging
+
+    def handler(request):
+        raise httpx.ReadTimeout("", request=request)  # httpx leaves the message empty
+
+    client = _client_with(handler, timeout=120)
+    with caplog.at_level(logging.WARNING, logger="src.services.trender_client"):
+        with pytest.raises(TrenderPushError) as exc:
+            await client.push_calls([{"symbol": "AYAL.TA"}, {"symbol": "ELAL.TA"}])
+
+    assert "ReadTimeout after 120s" in str(exc.value)
+    assert "http://trender.test/api/track-record/calls" in str(exc.value)
+    assert "2 call(s)" in str(exc.value)
+    text = caplog.text
+    assert "ReadTimeout after 120s" in text and "2 call(s)" in text
+    assert "/api/track-record/calls" in text and "attempt 1/3" in text
+    assert "failed (attempt 1/3): ;" not in text
+
+
+@pytest.mark.asyncio
+async def test_connect_error_with_message_keeps_type_and_message():
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(TrenderPushError) as exc:
+        await _client_with(handler).push_mentions(MENTIONS)
+    assert "ConnectError: connection refused" in str(exc.value)
+    assert "1 mention(s)" in str(exc.value)
+
+
+def test_timeout_comes_from_settings_and_an_explicit_arg_wins(monkeypatch):
+    monkeypatch.delenv("TRENDER_TIMEOUT_SECONDS", raising=False)
+    assert TrenderClient(base_url="http://x").timeout == 120.0
+    monkeypatch.setenv("TRENDER_TIMEOUT_SECONDS", "45")
+    assert TrenderClient(base_url="http://x").timeout == 45.0
+    assert TrenderClient(base_url="http://x", timeout=5).timeout == 5
+    monkeypatch.setenv("TRENDER_TIMEOUT_SECONDS", "junk")
+    assert TrenderClient(base_url="http://x").timeout == 120.0
+
+
+def test_push_batch_size_and_log_dir_settings(monkeypatch):
+    from src.config import get_settings
+
+    monkeypatch.delenv("TRENDER_PUSH_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("LOG_DIR", raising=False)
+    s = get_settings()
+    assert s.trender_push_batch_size == 50
+    assert s.log_dir.endswith("backend/logs")
+    monkeypatch.setenv("TRENDER_PUSH_BATCH_SIZE", "10")
+    monkeypatch.setenv("LOG_DIR", "/data/logs")
+    s = get_settings()
+    assert s.trender_push_batch_size == 10 and s.log_dir == "/data/logs"
+    monkeypatch.setenv("TRENDER_PUSH_BATCH_SIZE", "0")
+    assert get_settings().trender_push_batch_size == 50

@@ -33,7 +33,7 @@ MIN_CONFIDENCE = 0.3
 _STANCES = {"bullish", "bearish", "neutral"}
 
 # Track-record (recommendation) extraction contract version, sent with each call.
-EXTRACTION_VERSION = "tr-1"
+EXTRACTION_VERSION = "tr-2"
 # trender CallIn.conviction default, sent when the model gave no confidence (null would 422).
 CALL_DEFAULT_CONVICTION = 0.5
 
@@ -79,7 +79,9 @@ STRUCTURED_OUTPUT_METHOD = "function_calling"
 class RawPick(BaseModel):
     """One ticker/asset pick as returned by the LLM for a single item."""
 
-    symbol: str = Field(description="Ticker symbol, uppercase, e.g. NVDA. No $ prefix.")
+    symbol: str = Field(description="Ticker symbol, uppercase, e.g. NVDA. No $ prefix. Stocks listed on "
+        "the Tel Aviv Stock Exchange (TASE) MUST carry the Yahoo suffix .TA, e.g. "
+        "AYAL.TA; US listings have no suffix.")
     company_name: Optional[str] = Field(
         default=None, description="Full company/asset name if stated, else null."
     )
@@ -140,6 +142,14 @@ SYSTEM_PROMPT = (
     "(uppercase letters, optionally with a market suffix). Never invent a symbol.\n"
     "- If the author only mentions a company by name, put the name in company_name "
     "and your best-guess ticker in symbol; if you cannot map it, omit the pick.\n"
+    "- Exchange suffix: stocks listed on the Tel Aviv Stock Exchange (TASE) use the "
+    "Yahoo Finance symbol with the .TA suffix (AYAL.TA, ELAL.TA, QLTU.TA, "
+    "ESLT.TA). US listings have no suffix (NVDA, AAPL). Israeli channels (Hebrew) "
+    "mostly discuss TASE stocks: when the company is Israeli and traded in Tel Aviv "
+    "(prices in agorot/shekels, \"בורסה בתל אביב\", TA-35 / TA-125), always add .TA. "
+    "For a company listed in both places (e.g. TEVA on NYSE, TEVA.TA in Tel Aviv) "
+    "use the listing the author actually discusses; if it is unclear, use the "
+    "exchange the channel's currency and context point to.\n"
     "- stance must be exactly one of: bullish, bearish, neutral.\n"
     "- sentiment_score in [-1, 1]; confidence in [0, 1].\n"
     "- Each transcript line may be prefixed with a [Ns] time marker. Set "

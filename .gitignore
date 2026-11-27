@@ -77,3 +77,6 @@ yarn-error.log*
 
 # Collectors source copied in by deploy.sh for the Docker build
 backend/collectors_src/
+
+# Run logs written by the feeder and the backfills (LOG_DIR)
+backend/logs/

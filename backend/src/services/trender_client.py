@@ -24,9 +24,22 @@ class TrenderPushError(Exception):
     could not be reached at all.
     """
 
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(self, message: str, status_code: Optional[int] = None, reason: Optional[str] = None):
         super().__init__(message)
         self.status_code = status_code
+        # Short, count-free cause for summaries ("ReadTimeout after 120s", "HTTP 503").
+        self.reason = reason or message
+
+
+def describe_error(exc: BaseException, timeout: Optional[float] = None) -> str:
+    """Say what happened: the exception type plus its message, which httpx leaves EMPTY for
+    timeouts (``str(ReadTimeout())`` is ``""``). A timeout names how long it waited."""
+    kind = type(exc).__name__
+    message = str(exc).strip()
+    if isinstance(exc, httpx.TimeoutException) and timeout is not None:
+        suffix = f" after {timeout:g}s"
+        return f"{kind}{suffix}" + (f": {message}" if message else "")
+    return f"{kind}: {message}" if message else kind
 
 
 class TrenderClient:
@@ -38,7 +51,7 @@ class TrenderClient:
         ingest_token: Optional[str] = None,
         max_retries: int = 2,
         backoff_base: float = 0.5,
-        timeout: float = 30.0,
+        timeout: Optional[float] = None,
         client: Optional[httpx.AsyncClient] = None,
     ):
         settings = get_settings()
@@ -47,7 +60,8 @@ class TrenderClient:
         self.ingest_token = ingest_token if ingest_token is not None else settings.trender_ingest_token
         self.max_retries = max_retries
         self.backoff_base = backoff_base
-        self.timeout = timeout
+        # Explicit arg wins; otherwise TRENDER_TIMEOUT_SECONDS (default 120).
+        self.timeout = timeout if timeout is not None else settings.trender_timeout_seconds
         self._client = client  # injectable for tests
 
     def _headers(self) -> Dict[str, str]:
@@ -94,6 +108,7 @@ class TrenderClient:
         url = f"{self.base_url}{path}"
 
         last_error: Optional[str] = None
+        last_reason: Optional[str] = None
         last_status: Optional[int] = None  # HTTP status of the last 5xx; None for transport errors
         for attempt in range(self.max_retries + 1):
             try:
@@ -103,31 +118,35 @@ class TrenderClient:
                 logger.info("Pushed %s to trender: %s", label, url)
                 return data
             except (httpx.TransportError, httpx.TimeoutException) as e:
-                last_error = str(e)
+                last_error = last_reason = describe_error(e, self.timeout)
                 last_status = None
             except httpx.HTTPStatusError as e:
                 status, body = e.response.status_code, e.response.text[:500]
                 if status < 500:
-                    logger.error("trender rejected the batch: %s %s", status, body)
-                    raise TrenderPushError(f"trender returned {status}: {body}", status_code=status) from e
+                    logger.error("trender rejected %s at %s: %s %s", label, url, status, body)
+                    raise TrenderPushError(
+                        f"trender returned {status}: {body}", status_code=status, reason=f"HTTP {status}"
+                    ) from e
                 last_error = f"trender returned {status}: {body}"
                 last_status = status
+                last_reason = f"HTTP {status}"
 
             if attempt < self.max_retries:
                 delay = self.backoff_base * (2 ** attempt)
                 logger.warning(
-                    "Push to trender failed (attempt %d/%d): %s; retrying in %.1fs",
-                    attempt + 1,
-                    self.max_retries + 1,
-                    last_error,
-                    delay,
+                    "Push of %s to %s failed (attempt %d/%d): %s; retrying in %.1fs",
+                    label, url, attempt + 1, self.max_retries + 1, last_error, delay,
                 )
                 await asyncio.sleep(delay)
             else:
-                logger.error("Push to trender failed after %d attempts: %s", attempt + 1, last_error)
+                logger.error(
+                    "Push of %s to %s failed after %d attempts: %s",
+                    label, url, attempt + 1, last_error,
+                )
 
         raise TrenderPushError(
-            f"Failed to push {label} after retries: {last_error}", status_code=last_status
+            f"Failed to push {label} to {url} after {self.max_retries + 1} attempts: {last_error}",
+            status_code=last_status, reason=last_reason,
         )
 
     async def _post(self, url: str, payload: Dict[str, Any]) -> httpx.Response:

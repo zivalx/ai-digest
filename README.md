@@ -361,6 +361,27 @@ and does not itself stop at a date, so the real reach is N videos per channel (d
 filtered to the window. LLM calls cost money: dry-run first. See the docstring in
 `backend/src/backfill.py`.
 
+### Run logs and the calls report
+
+Every feeder cycle and every backfill (`src.backfill`, `scripts/backfill_track_record.py`) writes
+its own log, no shell redirection needed: `LOG_DIR/<UTC time>_<kind>_<source>.log` plus a
+`.summary.json` next to it (calls per outcome and reason, run stats). `LOG_DIR` defaults to
+`backend/logs/` (gitignored); on the server it is `/data/logs` on the data volume
+(`docker exec ai-digest-app ls /data/logs`). After each push the log has one line per call:
+channel, source item, symbol, outcome (accepted / duplicate / rejected / failed to send) and
+reason. Push failures name the exception, the wait, the endpoint and the batch size;
+`TRENDER_TIMEOUT_SECONDS` (default 120) and `TRENDER_PUSH_BATCH_SIZE` (default 50) tune them.
+
+Which calls trender has not taken, per channel, newest first, with links (read-only):
+
+```
+docker exec ai-digest-app python -m src.calls_report
+docker exec ai-digest-app python -m src.calls_report --status rejected --csv /data/logs/calls.csv
+```
+
+Tel Aviv stocks must reach trender as `X.TA` (e.g. `AYAL.TA`); the extraction prompt says so
+(`EXTRACTION_VERSION` tr-2).
+
 ## Development
 
 ### Code Quality
