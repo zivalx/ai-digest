@@ -38,3 +38,9 @@ async def engine():
 async def session_factory(engine):
     """Async sessionmaker bound to the in-memory engine."""
     return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest.fixture(autouse=True)
+def _run_logs_go_to_tmp(tmp_path_factory, monkeypatch):
+    """Feeder cycles and backfills write run logs; keep them out of backend/logs/."""
+    monkeypatch.setenv("LOG_DIR", str(tmp_path_factory.mktemp("run-logs")))

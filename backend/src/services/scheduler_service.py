@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_, select
 
+from .. import run_log
 from ..config import get_settings
 from ..database import AsyncSessionLocal
 from ..models import Cycle, CollectedData, ExtractedMention, SourceConfig
@@ -147,6 +148,30 @@ def _symbol_unique_batches(
             batches.append([row])
             symbols.append({symbol})
     return batches
+
+
+def _call_channel(row: ExtractedMention) -> str:
+    payload = row.call_payload_json or {}
+    return str((payload.get("citation") or {}).get("channel") or "-")
+
+
+def log_call(
+    row: ExtractedMention, outcome: str, reason: Optional[str] = None, detail: Optional[str] = None
+) -> None:
+    """One log line per call: channel, source item, symbol, outcome and reason.
+
+    Outcomes: accepted, duplicate, accepted_or_duplicate (trender reports only counts),
+    rejected, failed to send. Rejected and failed ones are warnings.
+    """
+    payload = row.call_payload_json or {}
+    bad = outcome in ("rejected", "failed to send")
+    logger.log(
+        logging.WARNING if bad else logging.INFO,
+        "call outcome=%s channel=%s item=%s symbol=%s reason=%s%s",
+        outcome, _call_channel(row), payload.get("source_item_id"), payload.get("symbol"),
+        reason or "-", f" ({detail})" if detail else "",
+    )
+    run_log.record_call("failed" if outcome == "failed to send" else outcome, reason)
 
 
 class SchedulerService:
@@ -760,6 +785,9 @@ class SchedulerService:
                              sum(1 for r in todo if not r.pushed_calls_to_trender))
                 break
 
+        for r in todo:
+            if id(r) not in attempted:  # the loop stopped before this call's batch
+                log_call(r, "failed to send", "not attempted: trender unreachable earlier in this run")
         result.sent = len(attempted)
         result.failed = sum(
             1 for r in todo
@@ -778,10 +806,17 @@ class SchedulerService:
                 [row.call_payload_json for row in batch]
             )
         except Exception as e:  # noqa: BLE001 - record failure, leave flag False
-            logger.error("trender calls push failed for %d call(s): %s", len(batch), e)
+            logger.error(
+                "trender calls push failed for %d call(s): %s: %s", len(batch), type(e).__name__, e
+            )
             for row in batch:
                 row.trender_calls_response = f"error: {e}"
             await db.commit()
+            splits = getattr(e, "status_code", None) in SPLITTABLE_HTTP_STATUS and len(batch) > 1
+            if not splits:  # a split batch is logged call by call when its singles are sent
+                reason = getattr(e, "reason", None) or f"{type(e).__name__}: {e}"
+                for row in batch:
+                    log_call(row, "failed to send", reason, str(e)[:200] if reason != str(e) else None)
             if getattr(e, "status_code", None) not in SPLITTABLE_HTTP_STATUS:
                 return False
             if len(batch) > 1:  # one invalid call must not block the others
@@ -800,13 +835,23 @@ class SchedulerService:
         result.accepted += int(response.get("accepted", len(batch) - duplicates - len(rejected)))
 
         text = str(response)
+        # trender reports duplicates only as a count, so name the outcome exactly when
+        # every pushed call in the batch was new or every one was already there.
+        pushed_in_batch = len(batch) - len(rejected)
+        ok_outcome = (
+            "accepted_or_duplicate" if 0 < duplicates < pushed_in_batch
+            else "duplicate" if duplicates and duplicates >= pushed_in_batch
+            else "accepted"
+        )
         for row in batch:
             reason = rejected.get(row.call_payload_json.get("symbol"))
             if reason is None:
                 row.pushed_calls_to_trender = True
                 row.trender_calls_response = text
+                log_call(row, ok_outcome)
             else:
                 row.trender_calls_response = f"rejected: {reason}; {text}"
+                log_call(row, "rejected", reason)
         await db.commit()
         return True
 

@@ -209,3 +209,98 @@ async def test_batch_size_follows_trender_push_batch_size(session_factory, monke
     trender = ScriptedTrender()
     await _repush(session_factory, trender)
     assert [len(r) for r in trender.requests] == [7, 7, 2]
+
+
+# --- one log line per call -------------------------------------------------------------------
+
+def _call_lines(caplog):
+    return [r for r in caplog.records if r.getMessage().startswith("call ")]
+
+
+@pytest.mark.asyncio
+async def test_every_call_gets_a_line_with_channel_item_symbol_outcome_and_reason(session_factory, caplog):
+    import logging
+
+    await _rows(session_factory, ["NVDA", "AYAL", "TEVA"])
+
+    def script(calls):
+        return {"accepted": 1, "duplicates": 1,
+                "rejected": [{"symbol": "AYAL", "reason": "unknown symbol"}]}
+
+    with caplog.at_level(logging.INFO):
+        await _repush(session_factory, ScriptedTrender(script))
+    lines = {r.getMessage().split("symbol=")[1].split()[0]: r for r in _call_lines(caplog)}
+    assert set(lines) == {"NVDA", "AYAL", "TEVA"}
+    bad = lines["AYAL"]
+    assert bad.levelno == logging.WARNING
+    assert "outcome=rejected" in bad.getMessage() and "reason=unknown symbol" in bad.getMessage()
+    assert "channel=@fin" in bad.getMessage() and "item=V1" in bad.getMessage()
+    # trender does not say which of the two good calls was the duplicate
+    assert "outcome=accepted_or_duplicate" in lines["NVDA"].getMessage()
+    assert lines["NVDA"].levelno == logging.INFO
+
+
+@pytest.mark.asyncio
+async def test_all_accepted_and_all_duplicate_are_named_exactly(session_factory, caplog):
+    import logging
+
+    await _rows(session_factory, ["NVDA"])
+    with caplog.at_level(logging.INFO):
+        await _repush(session_factory, ScriptedTrender())
+    assert "outcome=accepted " in _call_lines(caplog)[0].getMessage() + " "
+
+    caplog.clear()
+    await _rows(session_factory, ["AAPL"], start=5)
+    with caplog.at_level(logging.INFO):
+        await _repush(session_factory, ScriptedTrender(
+            lambda c: {"accepted": 0, "duplicates": 1, "rejected": []}))
+    assert "outcome=duplicate " in _call_lines(caplog)[0].getMessage() + " "
+
+
+@pytest.mark.asyncio
+async def test_failed_to_send_is_logged_per_call_with_the_reason(session_factory, caplog):
+    import logging
+
+    await _rows(session_factory, [f"S{i}" for i in range(PUSH_BATCH_SIZE + 2)])
+    err = TrenderPushError("Failed to push 50 call(s) to http://t/api: ReadTimeout after 120s",
+                           reason="ReadTimeout after 120s")
+    with caplog.at_level(logging.INFO):
+        await _repush(session_factory, ScriptedTrender(lambda calls: err))
+    lines = _call_lines(caplog)
+    assert len(lines) == PUSH_BATCH_SIZE + 2  # the unattempted second batch is logged too
+    assert all("outcome=failed to send" in r.getMessage() and r.levelno == logging.WARNING for r in lines)
+    assert all("ReadTimeout after 120s" in r.getMessage() or "not attempted" in r.getMessage() for r in lines)
+
+
+@pytest.mark.asyncio
+async def test_a_split_batch_logs_each_call_once_with_its_own_outcome(session_factory, caplog):
+    import logging
+
+    await _rows(session_factory, ["NVDA", "BAD"])
+
+    def script(calls):
+        if len(calls) > 1 or calls[0]["symbol"] == "BAD":
+            return TrenderPushError("trender returned 422: invalid", status_code=422, reason="HTTP 422")
+        return {"accepted": 1, "duplicates": 0, "rejected": []}
+
+    with caplog.at_level(logging.INFO):
+        await _repush(session_factory, ScriptedTrender(script))
+    msgs = [r.getMessage() for r in _call_lines(caplog)]
+    assert len(msgs) == 2
+    assert any("symbol=NVDA" in m and "outcome=accepted" in m for m in msgs)
+    assert any("symbol=BAD" in m and "outcome=failed to send" in m and "HTTP 422" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_outcomes_are_counted_in_the_run_summary(session_factory, tmp_path):
+    from src import run_log
+
+    await _rows(session_factory, ["NVDA", "AYAL"])
+
+    def script(calls):
+        return {"accepted": 1, "duplicates": 0, "rejected": [{"symbol": "AYAL", "reason": "unknown symbol"}]}
+
+    with run_log.run_log("repush", None, log_dir=tmp_path) as run:
+        await _repush(session_factory, ScriptedTrender(script))
+    assert run.summary["calls"]["accepted"] == 1
+    assert run.summary["calls"]["rejected"] == {"unknown symbol": 1}
