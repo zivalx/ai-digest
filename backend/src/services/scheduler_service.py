@@ -262,7 +262,10 @@ class SchedulerService:
         Returns the persisted Cycle. Uses its own DB session so it is safe to run
         concurrently / from the scheduler.
         """
-        cycle, _ = await self.run_cycle_with_stats(source_config)
+        with run_log.run_log("feeder", source_config.name) as run:
+            cycle, stats = await self.run_cycle_with_stats(source_config)
+            run.summary["stats"] = stats
+            run.summary["cycle_id"] = str(cycle.id)
         return cycle
 
     async def run_cycle_with_stats(
@@ -814,9 +817,11 @@ class SchedulerService:
             await db.commit()
             splits = getattr(e, "status_code", None) in SPLITTABLE_HTTP_STATUS and len(batch) > 1
             if not splits:  # a split batch is logged call by call when its singles are sent
-                reason = getattr(e, "reason", None) or f"{type(e).__name__}: {e}"
+                reason = getattr(e, "reason", None)  # short, count-free cause
+                detail = str(e)[:200] if reason else None
+                reason = reason or f"{type(e).__name__}: {e}"
                 for row in batch:
-                    log_call(row, "failed to send", reason, str(e)[:200] if reason != str(e) else None)
+                    log_call(row, "failed to send", reason, detail)
             if getattr(e, "status_code", None) not in SPLITTABLE_HTTP_STATUS:
                 return False
             if len(batch) > 1:  # one invalid call must not block the others

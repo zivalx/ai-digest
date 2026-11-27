@@ -80,3 +80,80 @@ def test_log_dir_comes_from_the_environment(tmp_path, monkeypatch):
     with rl.run_log("feeder", "a", now=NOW) as run:
         pass
     assert run.log_path.parent == tmp_path / "logs"
+
+
+# --- the three entry points write a run log by themselves ----------------------------------
+
+def _written(tmp_path):
+    return sorted(p.name for p in tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_feeder_cycle_writes_log_and_summary_with_call_counts(session_factory, tmp_path, monkeypatch):
+    from tests.test_scheduler_service import FakeExtraction, FakeOrchestrator, FakeTrender, _make_finance_config
+    from src.services.scheduler_service import SchedulerService
+
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    cfg = await _make_finance_config(session_factory)
+    svc = SchedulerService(
+        session_factory=session_factory,
+        orchestrator=FakeOrchestrator([{"video_id": "AAA", "channel": "@finance", "title": "One",
+                                        "transcript": "buy nvda"}]),
+        extraction_service=FakeExtraction(), trender_client=FakeTrender())
+    await svc.run_finance_cycle(cfg)
+
+    names = _written(tmp_path)
+    assert len(names) == 2
+    assert names[0].endswith("_feeder_Finance-YT.log") and names[1].endswith("_feeder_Finance-YT.summary.json")
+    summary = json.loads((tmp_path / names[1]).read_text())
+    assert summary["status"] == "ok" and summary["source_config"] == "Finance YT"
+    assert "new" in summary["stats"] and "calls" in summary
+    assert "Cycle " in (tmp_path / names[0]).read_text()
+
+
+def test_backfill_cli_writes_log_and_summary(session_factory, tmp_path, monkeypatch):
+    from src import backfill
+
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+
+    async def fake_run_backfill(**kwargs):
+        logging.getLogger("backfill").info("fake backfill ran")
+        return backfill.BackfillReport(days=3, max_items=None, window_start=NOW, dry_run=True)
+
+    monkeypatch.setattr(backfill, "run_backfill", fake_run_backfill)
+    assert backfill.main(["--days", "3", "--source", "Finance YT", "--dry-run"]) == 0
+    log, summary = sorted(tmp_path.iterdir())
+    assert log.name.endswith("_backfill_Finance-YT.log") and "fake backfill ran" in log.read_text()
+    assert json.loads(summary.read_text())["stats"]["days"] == 3
+
+
+@pytest.mark.asyncio
+async def test_track_record_script_writes_log_and_summary(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    from src.services.backfill_service import BackfillReport
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "backfill_track_record.py"
+    spec = importlib.util.spec_from_file_location("backfill_cli_log", path)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    class FakeSvc:
+        def __init__(self, *a, **k): pass
+
+        async def run(self, *a, **kw):
+            return BackfillReport(items_found=2, items_new=2, est_input_tokens=0, est_cost_usd=0.0,
+                                  calls_pushed=1, dry_run=False, calls_accepted=1,
+                                  items=[{"id": "V", "published": None, "transcript_chars": 1, "title": "t"}])
+
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "BackfillService", FakeSvc)
+    for name in ("CollectionOrchestrator", "ExtractionService", "TrenderClient"):
+        monkeypatch.setattr(cli, name, lambda: None)
+    await cli.main(cli.parse_args(["--source-config", "TR English"]))
+
+    names = _written(tmp_path)
+    assert names[0].endswith("_backfill-track-record_TR-English.log")
+    summary = json.loads((tmp_path / names[1]).read_text())
+    assert summary["stats"]["calls_accepted"] == 1 and "items" not in summary["stats"]

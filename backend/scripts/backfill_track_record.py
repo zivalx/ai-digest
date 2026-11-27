@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.database import AsyncSessionLocal  # noqa: E402
+from src.run_log import run_log  # noqa: E402
 from src.services.backfill_service import BackfillService  # noqa: E402
 from src.services.collection_orchestrator import CollectionOrchestrator  # noqa: E402
 from src.services.extraction_service import ExtractionService  # noqa: E402
@@ -81,13 +82,28 @@ def print_calls(accepted: int, duplicate: int, rejected: dict, failed: int) -> N
         print("Rejected/failed calls are kept and retried by the next feeder cycle or --repush.")
 
 
+def summarize_report(report) -> dict:
+    """Counts only (no item lists) for the run's summary file."""
+    return {k: v for k, v in vars(report).items() if k not in ("items", "unavailable")} | {
+        "unavailable_items": len(report.unavailable)}
+
+
 async def main(args) -> None:
+    label = "repush" if args.repush else args.source_config
+    with run_log("backfill-track-record", label) as run:
+        if run.log_path:
+            print(f"run log: {run.log_path}", file=sys.stderr)
+        await _main(args, run)
+
+
+async def _main(args, run) -> None:
     service = BackfillService(
         CollectionOrchestrator(), ExtractionService(), TrenderClient(),
         AsyncSessionLocal, usd_per_mtok=args.usd_per_mtok,
     )
     if args.repush:
         result = await service.repush()
+        run.summary["stats"] = {"sent": result.sent}
         print(f"{result.sent} unpushed call(s) re-sent")
         print_calls(result.accepted, result.duplicate, result.rejected, result.failed)
         return
@@ -98,6 +114,7 @@ async def main(args) -> None:
         concurrency=args.concurrency, delay=args.delay, cookies_file=args.cookies,
         no_whisper=args.no_whisper,
     )
+    run.summary["stats"] = summarize_report(report)
     for it in report.items:
         print(f"  {it['id']}  {it['published'] or '-'}  {it['transcript_chars']} chars  {it['title'] or ''}")
     if report.unavailable:
